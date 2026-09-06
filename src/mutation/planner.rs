@@ -7,6 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use cap_fs_ext::DirExt;
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -525,11 +526,29 @@ impl<'a> WorkspaceEditPlanner<'a> {
             .affected
             .iter()
             .map(|path| {
-                virtual_workspace
+                let mut entry = virtual_workspace
                     .entries
                     .get(path)
                     .map(|state| state.manifest.clone())
-                    .unwrap_or_else(|| missing_manifest(path))
+                    .unwrap_or_else(|| missing_manifest(path));
+                if entry.resource_kind == ResourceKind::Directory {
+                    let children = virtual_workspace
+                        .entries
+                        .range(path.clone()..)
+                        .take_while(|(child, _)| child.starts_with(path))
+                        .filter(|(child, state)| {
+                            child.parent() == Some(path.as_path()) && state.manifest.exists
+                        })
+                        .map(|(child, state)| {
+                            (
+                                child.file_name().unwrap().to_str().unwrap().to_owned(),
+                                state.manifest.resource_kind,
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    entry.content_digest = Some(directory_membership_digest(&children));
+                }
+                entry
             })
             .collect::<Vec<_>>();
         let before_by_path = before_manifest
@@ -578,6 +597,35 @@ impl<'a> WorkspaceEditPlanner<'a> {
         } else {
             Err(problems)
         }
+    }
+
+    /// Observes only bound directory child sets; an omitted certificate never authorizes enumeration.
+    pub(crate) fn inspect_manifest(
+        &self,
+        template: &[ManifestEntry],
+    ) -> Result<Vec<ManifestEntry>, Vec<WorkspaceEditProblem>> {
+        let paths = template
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let certified = template
+            .iter()
+            .filter(|entry| {
+                entry.resource_kind == ResourceKind::Directory && entry.content_digest.is_some()
+            })
+            .map(|entry| &entry.path)
+            .collect::<BTreeSet<_>>();
+        let mut observed = self.inspect_manifest_paths(&paths)?;
+        for entry in observed.iter_mut().filter(|entry| {
+            entry.resource_kind == ResourceKind::Directory && certified.contains(&entry.path)
+        }) {
+            entry.content_digest = Some(directory_membership_digest(
+                &self
+                    .directory_children(&entry.path, 0)
+                    .map_err(|problem| vec![problem])?,
+            ));
+        }
+        Ok(observed)
     }
 
     pub(crate) fn capability_root(&self) -> &Dir {
@@ -823,7 +871,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
             return;
         }
         if !current.manifest.exists
-            && let Err(problem) = self.require_existing_parent(&path, index)
+            && let Err(problem) = self.require_existing_parent(workspace, &path, index)
         {
             problems.push(problem);
             return;
@@ -831,10 +879,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let mut next = if current.manifest.exists {
             current
         } else {
-            ResourceState {
-                manifest: missing_manifest(&path),
-                text: None,
-            }
+            missing_resource(&path)
         };
         next.manifest.exists = true;
         next.manifest.resource_kind = ResourceKind::File;
@@ -971,7 +1016,13 @@ impl<'a> WorkspaceEditPlanner<'a> {
             ));
             return;
         }
-        if let Err(problem) = self.require_existing_parent(&new_path, index) {
+        if destination.manifest.resource_kind == ResourceKind::Directory
+            && let Err(problem) = self.load_resource_tree(workspace, &new_path, index)
+        {
+            problems.push(problem);
+            return;
+        }
+        if let Err(problem) = self.require_existing_parent(workspace, &new_path, index) {
             problems.push(problem);
             return;
         }
@@ -998,11 +1049,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         for path in destination_tree {
-            workspace.entries.remove(&path);
+            workspace
+                .entries
+                .insert(path.clone(), missing_resource(&path));
             workspace.affected.insert(path);
         }
         for (path, state) in &moved {
-            workspace.entries.remove(path);
+            workspace
+                .entries
+                .insert(path.clone(), missing_resource(path));
             workspace.affected.insert(path.clone());
             let relative = path.strip_prefix(&old_path).unwrap();
             let target = if relative.as_os_str().is_empty() {
@@ -1093,6 +1148,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
             .entries
             .range(path.clone()..)
             .take_while(|(candidate, _)| candidate.starts_with(&path))
+            .filter(|(_, state)| state.manifest.exists)
             .map(|(candidate, _)| candidate.clone())
             .collect::<Vec<_>>();
         if source.manifest.resource_kind == ResourceKind::Directory
@@ -1109,7 +1165,9 @@ impl<'a> WorkspaceEditPlanner<'a> {
             return;
         }
         for target in subtree {
-            workspace.entries.remove(&target);
+            workspace
+                .entries
+                .insert(target.clone(), missing_resource(&target));
             workspace.affected.insert(target);
         }
         summary.deletes = summary.deletes.saturating_add(1);
@@ -1262,7 +1320,16 @@ impl<'a> WorkspaceEditPlanner<'a> {
             }
             return Ok(());
         }
-        let state = self.inspect_resource(path, index, load_text)?;
+        let state = if path.ancestors().skip(1).any(|ancestor| {
+            workspace
+                .entries
+                .get(ancestor)
+                .is_some_and(|state| !state.manifest.exists)
+        }) {
+            missing_resource(path)
+        } else {
+            self.inspect_resource(path, index, load_text)?
+        };
         if state.manifest.exists {
             workspace.rollback_bytes = workspace
                 .rollback_bytes
@@ -1298,29 +1365,34 @@ impl<'a> WorkspaceEditPlanner<'a> {
                     ),
                 ));
             }
-            let entries = fs::read_dir(&directory).map_err(|error| {
-                problem(
-                    "filesystem_capability_unavailable",
-                    "A directory cannot be enumerated.",
-                    Some(index),
-                    Some(&directory),
-                    Some(json!({"reason": error.to_string()})),
-                )
-            })?;
-            for entry in entries {
-                let path = entry
-                    .map_err(|error| {
-                        problem(
-                            "filesystem_capability_unavailable",
-                            "A directory entry cannot be inspected.",
-                            Some(index),
-                            Some(&directory),
-                            Some(json!({"reason": error.to_string()})),
-                        )
-                    })?
-                    .path();
-                self.validate_existing_ancestors(&path, index)?;
-                self.load_exact_resource(workspace, &path, index, false)?;
+            if workspace.entries[&directory]
+                .manifest
+                .content_digest
+                .is_none()
+            {
+                let children = self.directory_children(&directory, index)?;
+                let digest = directory_membership_digest(&children);
+                workspace.before.get_mut(&directory).unwrap().content_digest = Some(digest.clone());
+                workspace
+                    .entries
+                    .get_mut(&directory)
+                    .unwrap()
+                    .manifest
+                    .content_digest = Some(digest);
+                for name in children.keys() {
+                    self.load_exact_resource(workspace, &directory.join(name), index, false)?;
+                }
+            }
+            let children = workspace
+                .entries
+                .range(directory.clone()..)
+                .take_while(|(path, _)| path.starts_with(&directory))
+                .filter(|(path, state)| {
+                    path.parent() == Some(directory.as_path()) && state.manifest.exists
+                })
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            for path in children {
                 if workspace.entries[&path].manifest.resource_kind == ResourceKind::Directory {
                     pending.push((path, depth.saturating_add(1)));
                 }
@@ -1340,6 +1412,69 @@ impl<'a> WorkspaceEditPlanner<'a> {
         Ok(())
     }
 
+    fn directory_children(
+        &self,
+        path: &Path,
+        index: u64,
+    ) -> Result<BTreeMap<String, ResourceKind>, WorkspaceEditProblem> {
+        self.validate_existing_ancestors(path, index)?;
+        let unavailable = |error: std::io::Error| {
+            problem(
+                "filesystem_capability_unavailable",
+                "A directory cannot be enumerated.",
+                Some(index),
+                Some(path),
+                Some(json!({"reason": error.to_string()})),
+            )
+        };
+        let directory = self
+            ._workspace_dir
+            .open_dir_nofollow(path.strip_prefix(self.workspace).unwrap())
+            .map_err(unavailable)?;
+        let mut children = BTreeMap::new();
+        for entry in directory.entries().map_err(unavailable)? {
+            let entry = entry.map_err(unavailable)?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                problem(
+                    "unsupported_resource_kind",
+                    "Directory child names must be representable as UTF-8 JSON strings.",
+                    Some(index),
+                    Some(path),
+                    None,
+                )
+            })?;
+            let child = path.join(&name);
+            self.validate_existing_ancestors(&child, index)?;
+            let kind = entry.file_type().map_err(unavailable)?;
+            let kind = if kind.is_file() {
+                ResourceKind::File
+            } else if kind.is_dir() {
+                ResourceKind::Directory
+            } else {
+                return Err(problem(
+                    "unsupported_resource_kind",
+                    "The Mutation resource is not a regular file or directory.",
+                    Some(index),
+                    Some(&child),
+                    None,
+                ));
+            };
+            children.insert(name, kind);
+            if children.len() as u64 >= self.mutation_limits.max_entries {
+                return Err(problem(
+                    "resource_limit_exceeded",
+                    "A directory has too many entries.",
+                    Some(index),
+                    Some(path),
+                    Some(json!({
+                        "resource": "entries", "limit": self.mutation_limits.max_entries, "observed": children.len() + 1,
+                    })),
+                ));
+            }
+        }
+        Ok(children)
+    }
+
     fn inspect_resource(
         &self,
         path: &Path,
@@ -1349,10 +1484,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ResourceState {
-                    manifest: missing_manifest(path),
-                    text: None,
-                });
+                return Ok(missing_resource(path));
             }
             Err(error) => {
                 return Err(problem(
@@ -1431,8 +1563,26 @@ impl<'a> WorkspaceEditPlanner<'a> {
         })
     }
 
-    fn require_existing_parent(&self, path: &Path, index: u64) -> Result<(), WorkspaceEditProblem> {
+    fn require_existing_parent(
+        &self,
+        workspace: &VirtualWorkspace,
+        path: &Path,
+        index: u64,
+    ) -> Result<(), WorkspaceEditProblem> {
         let parent = path.parent().unwrap_or(self.workspace);
+        if let Some(state) = workspace.entries.get(parent) {
+            return if state.manifest.resource_kind == ResourceKind::Directory {
+                Ok(())
+            } else {
+                Err(problem(
+                    "parent_missing",
+                    "The operation parent is not a directory.",
+                    Some(index),
+                    Some(parent),
+                    None,
+                ))
+            };
+        }
         let metadata = fs::symlink_metadata(parent).map_err(|_| {
             problem(
                 "parent_missing",
@@ -1779,6 +1929,17 @@ fn uri_contains_path_traversal(raw: &str) -> bool {
         }
         matches!(decoded_dots.as_str(), "." | "..")
     })
+}
+
+fn directory_membership_digest(children: &BTreeMap<String, ResourceKind>) -> String {
+    digest_canonical_value("lspctl-directory-membership-v1", &json!(children))
+}
+
+fn missing_resource(path: &Path) -> ResourceState {
+    ResourceState {
+        manifest: missing_manifest(path),
+        text: None,
+    }
 }
 
 fn missing_manifest(path: &Path) -> ManifestEntry {
@@ -2352,6 +2513,220 @@ mod tests {
                 max_preauthorized_callbacks: 64,
             },
         )
+    }
+
+    #[test]
+    fn directory_membership_covers_overwritten_destination() {
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("source.txt"), b"source").unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        let extra = destination.join("nested/destination-only.txt");
+        fs::write(&extra, b"destination-only").unwrap();
+        let edit = json!({"documentChanges": [{
+            "kind": "rename", "oldUri": Url::from_file_path(&source).unwrap(),
+            "newUri": Url::from_file_path(&destination).unwrap(),
+            "options": {"overwrite": true}
+        }]});
+        let (previews, mut mutation) = settings();
+        let planned = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .plan_workspace_edit(&edit)
+        .unwrap();
+        for path in [destination.join("nested"), extra] {
+            assert!(
+                planned
+                    .plan
+                    .before_manifest
+                    .iter()
+                    .any(|entry| entry.path == path && entry.exists),
+                "{}",
+                path.display()
+            );
+            assert!(
+                planned
+                    .plan
+                    .intended_manifest
+                    .iter()
+                    .any(|entry| entry.path == path && !entry.exists),
+                "{}",
+                path.display()
+            );
+        }
+        mutation.max_entries = 4;
+        let problems = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .plan_workspace_edit(&edit)
+        .unwrap_err();
+        assert!(problems.iter().any(|problem| {
+            problem
+                .data
+                .as_ref()
+                .is_some_and(|data| data["resource"] == "entries")
+        }));
+        mutation.max_entries = 100;
+        mutation.max_rollback_bytes = b"source".len() as u64;
+        let problems = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .plan_workspace_edit(&edit)
+        .unwrap_err();
+        assert!(problems.iter().any(|problem| {
+            problem
+                .data
+                .as_ref()
+                .is_some_and(|data| data["resource"] == "rollbackBytes")
+        }));
+    }
+
+    #[test]
+    fn directory_membership_limits_and_no_follow() {
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("source.txt"), b"source").unwrap();
+        fs::create_dir_all(destination.join("one/two")).unwrap();
+        let extra = destination.join("one/two/extra.txt");
+        fs::write(&extra, b"untouched").unwrap();
+        let edit = json!({"documentChanges": [{"kind": "rename",
+            "oldUri": Url::from_file_path(&source).unwrap(), "newUri": Url::from_file_path(&destination).unwrap(),
+            "options": {"overwrite": true}}]});
+        let (previews, mut mutation) = settings();
+        for (entries, depth, resource) in [(4, 10, "entries"), (100, 1, "recursionDepth")] {
+            mutation.max_entries = entries;
+            mutation.max_recursion_depth = depth;
+            let problems = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .plan_workspace_edit(&edit)
+            .unwrap_err();
+            assert!(
+                problems.iter().any(|problem| problem
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["resource"] == resource)),
+                "{problems:?}"
+            );
+            assert_eq!(fs::read(&extra).unwrap(), b"untouched");
+        }
+        let mut ignored = edit.clone();
+        ignored["documentChanges"][0]["options"] = json!({"ignoreIfExists": true});
+        assert!(
+            WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation
+            )
+            .unwrap()
+            .plan_workspace_edit(&ignored)
+            .unwrap()
+            .plan
+            .operations
+            .is_empty()
+        );
+        mutation.max_recursion_depth = 10;
+        mutation.max_entries = 6;
+        let problems = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .plan_workspace_edit(&edit)
+        .unwrap_err();
+        // The six before entries fit; the destination-only tombstones and moved target also count.
+        assert!(problems.iter().any(|problem| {
+            problem
+                .data
+                .as_ref()
+                .is_some_and(|data| data["resource"] == "entries")
+        }));
+        mutation.max_entries = 100;
+        let planned = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .plan_workspace_edit(&edit)
+        .unwrap();
+        assert!(!planned.plan.before_manifest.is_empty());
+
+        #[cfg(any(unix, windows))]
+        {
+            let outside = TempDir::new().unwrap();
+            fs::write(outside.path().join("sentinel"), b"outside").unwrap();
+            let link = destination.join("outside");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            #[cfg(windows)]
+            {
+                // Junctions exercise reparse rejection without requiring symlink privileges.
+                let result = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(outside.path())
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let problems = planner.plan_workspace_edit(&edit).unwrap_err();
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.code == "symlink_or_reparse_point")
+            );
+            assert!(
+                planner
+                    .inspect_manifest(&planned.plan.before_manifest)
+                    .is_err()
+            );
+            // Editing one file must not enumerate its siblings or the whole Workspace.
+            assert!(planner.plan_workspace_edit(&json!({"changes": {Url::from_file_path(&extra).unwrap().to_string(): [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "x"
+            }]}})).is_ok());
+            assert_eq!(
+                fs::read(outside.path().join("sentinel")).unwrap(),
+                b"outside"
+            );
+            #[cfg(windows)]
+            fs::remove_dir(&link).unwrap();
+        }
     }
 
     #[test]

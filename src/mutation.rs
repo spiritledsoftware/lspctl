@@ -28,7 +28,7 @@ use crate::{
 };
 
 use application::{
-    ApplicationContext, apply_preview, lock_workspace, manifest_mismatches,
+    ApplicationContext, apply_preview, lock_workspace, preview_manifest_mismatches,
     reconcile_recovery_status, recover_accept_current, recover_rollback,
 };
 use planner::{
@@ -236,16 +236,9 @@ where
         ));
     }
     let current = planner
-        .inspect_manifest_paths(
-            &planned
-                .plan
-                .before_manifest
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect::<Vec<_>>(),
-        )
+        .inspect_manifest(&planned.plan.before_manifest)
         .map_err(|problems| unsupported_filesystem(workspace_uri, &problems))?;
-    let stale_reasons = manifest_mismatches(&planned.plan.before_manifest, &current);
+    let stale_reasons = preview_manifest_mismatches(&planned.plan, &current);
     if !stale_reasons.is_empty() {
         return Err(ContractFailure {
             exit_code: 6,
@@ -365,16 +358,9 @@ pub(crate) fn create_callback_preview(
         return Ok(Value::Null);
     }
     let current = planner
-        .inspect_manifest_paths(
-            &planned
-                .plan
-                .before_manifest
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect::<Vec<_>>(),
-        )
+        .inspect_manifest(&planned.plan.before_manifest)
         .map_err(|problems| unsupported_filesystem(workspace_uri, &problems))?;
-    let stale_reasons = manifest_mismatches(&planned.plan.before_manifest, &current);
+    let stale_reasons = preview_manifest_mismatches(&planned.plan, &current);
     if !stale_reasons.is_empty() {
         return Err(ContractFailure {
             exit_code: 6,
@@ -450,16 +436,9 @@ fn persist_preview(
         return Ok(Value::Null);
     }
     let current = planner
-        .inspect_manifest_paths(
-            &planned
-                .plan
-                .before_manifest
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect::<Vec<_>>(),
-        )
+        .inspect_manifest(&planned.plan.before_manifest)
         .map_err(|problems| unsupported_filesystem(&configuration.workspace_uri, &problems))?;
-    let stale_reasons = manifest_mismatches(&planned.plan.before_manifest, &current);
+    let stale_reasons = preview_manifest_mismatches(&planned.plan, &current);
     if !stale_reasons.is_empty() {
         return Err(ContractFailure {
             exit_code: 6,
@@ -1029,19 +1008,11 @@ fn refresh_preview_presentation(
         stored.preview.diff = None;
         return;
     };
-    let paths = stored
-        .preview
-        .plan
-        .before_manifest
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect::<Vec<_>>();
-    let Ok(current) = planner.inspect_manifest_paths(&paths) else {
+    let Ok(current) = planner.inspect_manifest(&stored.preview.plan.before_manifest) else {
         stored.preview.diff = None;
         return;
     };
-    stored.preview.stale_reasons =
-        manifest_mismatches(&stored.preview.plan.before_manifest, &current);
+    stored.preview.stale_reasons = preview_manifest_mismatches(&stored.preview.plan, &current);
     stored.preview.diff = if stored.preview.stale_reasons.is_empty() {
         preview_diff(stored)
     } else {

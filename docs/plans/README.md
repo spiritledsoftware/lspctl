@@ -13,7 +13,7 @@ Effort: **S** hours, **M** roughly a day, **L** multiple days, including tests. 
 | Order | Plan / audit finding | Title | Priority | Effort | Risk | Depends on | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | [001](001-confine-skill-install-recovery.md) | Confine skill-install recovery and validate existing ancestors | P1 | M | MED | — | DONE |
-| 2 | [002](002-bind-recursive-directory-membership.md) | Bind exact recursive directory membership | P1 | M | MED | — | TODO |
+| 2 | [002](002-bind-recursive-directory-membership.md) | Bind exact recursive directory membership | P1 | M | MED | — | DONE |
 | 3 | [003](003-preserve-external-changes-during-rollback.md) | Preserve external changes during rollback | P1 | L | HIGH | 002 | TODO |
 | 4 | [004](004-preserve-partial-result-chunks.md) | Preserve partial-result chunks across the Owner boundary | P1 | S | LOW | — | TODO |
 | 5 | [005](005-prevent-owner-maintenance-starvation.md) | Prevent maintenance starvation under notification traffic | P1 | S | LOW | — | TODO |

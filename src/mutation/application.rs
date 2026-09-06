@@ -23,7 +23,8 @@ use crate::{
 
 use super::{
     planner::{
-        CanonicalOperation, ManifestEntry, ResourceKind, WorkspaceEditPlanner, WorkspaceEditProblem,
+        CanonicalOperation, CanonicalPlan, ManifestEntry, ResourceKind, WorkspaceEditPlanner,
+        WorkspaceEditProblem,
     },
     state::{
         BackupEntry, MUTATION_STATE_VERSION, MutationStateStore, ReceiptRecord, StoredPreview,
@@ -140,19 +141,11 @@ pub(crate) fn apply_preview(
     )
     .map_err(|problem| unsupported_filesystem_failure(&stored.preview.workspace_uri, &[problem]))?;
     let current = planner
-        .inspect_manifest_paths(
-            &stored
-                .preview
-                .plan
-                .before_manifest
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect::<Vec<_>>(),
-        )
+        .inspect_manifest(&stored.preview.plan.before_manifest)
         .map_err(|problems| {
             unsupported_filesystem_failure(&stored.preview.workspace_uri, &problems)
         })?;
-    let stale_reasons = manifest_mismatches(&stored.preview.plan.before_manifest, &current);
+    let stale_reasons = preview_manifest_mismatches(&stored.preview.plan, &current);
     if !stale_reasons.is_empty() {
         let _ = context.store.release_preview(&mut stored);
         return Err(ContractFailure {
@@ -241,15 +234,8 @@ pub(crate) fn apply_preview(
         &transaction.artifact_directory,
         &stored.preview.plan.operations,
     );
-    let intended_paths = stored
-        .preview
-        .plan
-        .intended_manifest
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect::<Vec<_>>();
     let observed = planner
-        .inspect_manifest_paths(&intended_paths)
+        .inspect_manifest(&stored.preview.plan.intended_manifest)
         .unwrap_or_default();
     let manifest_ok =
         manifest_mismatches(&stored.preview.plan.intended_manifest, &observed).is_empty();
@@ -363,8 +349,7 @@ pub(crate) fn apply_preview(
         }
         Err(_) => {
             transaction.state = TransactionState::RecoveryRequired;
-            transaction.observed_manifest = planner
-                .inspect_manifest_paths(&transaction_paths(&transaction))
+            transaction.observed_manifest = inspect_transaction_manifest(&planner, &transaction)
                 .unwrap_or_else(|_| inspect_paths_best_effort(&transaction.before_manifest));
             transaction.manifest_digest = manifest_digest(&transaction.observed_manifest);
             context.store.write_transaction(&transaction)?;
@@ -508,11 +493,9 @@ pub(crate) fn reconcile_recovery_status(
         mutation_limits,
     )
     .map_err(|problem| unsupported_filesystem_failure(&transaction.workspace_uri, &[problem]))?;
-    let current = planner
-        .inspect_manifest_paths(&transaction_paths(&transaction))
-        .map_err(|problems| {
-            unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
-        })?;
+    let current = inspect_transaction_manifest(&planner, &transaction).map_err(|problems| {
+        unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
+    })?;
     let abandoned_commit = transaction.state == TransactionState::Committing
         || !manifest_mismatches(&transaction.before_manifest, &current).is_empty();
     transaction.observed_manifest = current;
@@ -618,11 +601,9 @@ fn recover_transaction(
         mutation_limits,
     )
     .map_err(|problem| unsupported_filesystem_failure(&transaction.workspace_uri, &[problem]))?;
-    let current = planner
-        .inspect_manifest_paths(&transaction_paths(&transaction))
-        .map_err(|problems| {
-            unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
-        })?;
+    let current = inspect_transaction_manifest(&planner, &transaction).map_err(|problems| {
+        unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
+    })?;
     let current_digest = manifest_digest(&current);
     if current_digest != transaction.manifest_digest {
         return Err(ContractFailure {
@@ -669,8 +650,7 @@ fn recover_transaction(
     let final_manifest = if accept_current {
         current
     } else {
-        planner
-            .inspect_manifest_paths(&transaction_paths(&transaction))
+        inspect_transaction_manifest(&planner, &transaction)
             .unwrap_or_else(|_| inspect_paths_best_effort(&transaction.before_manifest))
     };
     let recovery_receipt_id = store.new_receipt_id()?;
@@ -1385,11 +1365,9 @@ fn rollback_transaction(
     planner: &WorkspaceEditPlanner<'_>,
 ) -> Result<Vec<ManifestEntry>, String> {
     rollback_resource_operations(transaction, planner)?;
-    let current = planner
-        .inspect_manifest_paths(&transaction_paths(transaction))
-        .map_err(|problems| {
-            format!("The partial filesystem is unsafe for automatic rollback: {problems:?}")
-        })?;
+    let current = inspect_transaction_manifest(planner, transaction).map_err(|problems| {
+        format!("The partial filesystem is unsafe for automatic rollback: {problems:?}")
+    })?;
     let mut restore_in_place = Vec::new();
     for expected in transaction
         .before_manifest
@@ -1441,8 +1419,7 @@ fn rollback_transaction(
         restore_file_backup(planner, &backup_path, &destination)
             .map_err(|error| error.to_string())?;
     }
-    let restored = planner
-        .inspect_manifest_paths(&transaction_paths(transaction))
+    let restored = inspect_transaction_manifest(planner, transaction)
         .map_err(|_| "The restored filesystem cannot be inspected.".to_owned())?;
     let mismatches = manifest_mismatches(&transaction.before_manifest, &restored);
     if mismatches.is_empty() {
@@ -1670,15 +1647,31 @@ fn backup_path_for(backups: &[BackupEntry], path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn transaction_paths(transaction: &TransactionRecord) -> Vec<PathBuf> {
-    transaction
+fn inspect_transaction_manifest(
+    planner: &WorkspaceEditPlanner<'_>,
+    transaction: &TransactionRecord,
+) -> Result<Vec<ManifestEntry>, Vec<WorkspaceEditProblem>> {
+    let mut template = transaction
         .before_manifest
         .iter()
-        .chain(transaction.intended_manifest.iter())
-        .map(|entry| entry.path.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .chain(&transaction.intended_manifest)
+        .map(|entry| (&entry.path, entry))
+        .collect::<BTreeMap<_, _>>();
+    // Retain certificates at either end of a rename, without enriching legacy or ignored directories.
+    for entry in transaction
+        .before_manifest
+        .iter()
+        .chain(&transaction.intended_manifest)
+        .chain(&transaction.observed_manifest)
+        .filter(|entry| {
+            entry.resource_kind == ResourceKind::Directory && entry.content_digest.is_some()
+        })
+    {
+        if let Some(bound) = template.get_mut(&entry.path) {
+            *bound = entry;
+        }
+    }
+    planner.inspect_manifest(&template.into_values().cloned().collect::<Vec<_>>())
 }
 
 fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> std::io::Result<()> {
@@ -1966,6 +1959,36 @@ fn inspect_path_best_effort(path: &Path) -> ManifestEntry {
             .flatten(),
         metadata_digest: None,
     }
+}
+
+pub(crate) fn preview_manifest_mismatches(
+    plan: &CanonicalPlan,
+    actual: &[ManifestEntry],
+) -> Vec<Value> {
+    let mut reasons = manifest_mismatches(&plan.before_manifest, actual);
+    for entry in &plan.before_manifest {
+        if entry.exists
+            && entry.resource_kind == ResourceKind::Directory
+            && entry.content_digest.is_none()
+            && plan.operations.iter().any(|operation| match operation {
+                CanonicalOperation::Delete { path, .. } => entry.path.starts_with(path),
+                CanonicalOperation::Rename {
+                    old_path,
+                    new_path,
+                    overwrite,
+                    ..
+                } => {
+                    entry.path.starts_with(old_path)
+                        || (*overwrite && entry.path.starts_with(new_path))
+                }
+                _ => false,
+            })
+        {
+            reasons.push(json!({"code": "resource_content", "path": entry.path,
+                "message": "Directory membership was not bound by this Preview; create a fresh Preview."}));
+        }
+    }
+    reasons
 }
 
 pub(crate) fn manifest_mismatches(
@@ -2277,6 +2300,467 @@ mod tests {
 
     use super::*;
     use crate::mutation::{PreviewRecordContext, create_preview_record};
+
+    fn test_application_context<'a>(
+        store: &'a MutationStateStore,
+        previews: &'a PreviewSettings,
+        receipts: &'a ReceiptSettings,
+        mutation: &'a MutationSettings,
+    ) -> ApplicationContext<'a> {
+        ApplicationContext {
+            store,
+            preview_limits: previews,
+            receipt_limits: receipts,
+            mutation_limits: mutation,
+            reauthorize: None,
+            post_commit: None,
+            preauthorized: false,
+            caller_deadline: None,
+        }
+    }
+
+    fn persist_test_preview(
+        context: &ApplicationContext<'_>,
+        workspace: &Path,
+        edit: Value,
+        planned: super::super::planner::PlannedWorkspaceEdit,
+    ) -> String {
+        let id = context.store.new_preview_id().unwrap();
+        let record = create_preview_record(
+            PreviewRecordContext {
+                preview_id: &id,
+                workspace_uri: url::Url::from_directory_path(workspace).unwrap().as_str(),
+                server: None,
+                session_identity: &format!("sid_{}", "0".repeat(64)),
+                position_encoding: "utf-8",
+                source: json!({"kind": "test"}),
+                edit,
+                command: None,
+            },
+            planned,
+        );
+        context
+            .store
+            .create_preview(
+                record,
+                workspace.to_path_buf(),
+                "sha256:test".to_owned(),
+                None,
+                context.preview_limits,
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn directory_membership_rejects_added_descendant() {
+        for kind in ["delete", "rename"] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            fs::create_dir_all(source.join("nested")).unwrap();
+            let old = source.join("nested/old.txt");
+            let added = source.join("nested/added.txt");
+            fs::write(&old, b"previewed").unwrap();
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+            let uri = url::Url::from_file_path(&source).unwrap();
+            let operation = if kind == "delete" {
+                json!({"kind": kind, "uri": uri, "options": {"recursive": true}})
+            } else {
+                json!({"kind": kind, "oldUri": uri,
+                    "newUri": url::Url::from_file_path(workspace.path().join("moved")).unwrap()})
+            };
+            let edit = json!({"documentChanges": [operation]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let planned = planner.plan_workspace_edit(&edit).unwrap();
+            let id = persist_test_preview(&context, workspace.path(), edit, planned);
+            fs::write(&added, b"not previewed").unwrap();
+
+            let failure = apply_preview(&mut context, &id).unwrap_err();
+
+            assert_eq!(failure.code, "preview_stale", "{kind}");
+            assert_eq!(fs::read(&old).unwrap(), b"previewed", "{kind}");
+            assert_eq!(fs::read(&added).unwrap(), b"not previewed", "{kind}");
+            assert!(store.list_transactions().unwrap().is_empty());
+            assert!(store.list_receipts().unwrap().is_empty());
+            assert!(!store.read_preview(&id).unwrap().preview.reserved);
+        }
+    }
+
+    #[test]
+    fn directory_membership_legacy_preview_requires_recreation() {
+        for kind in ["delete", "rename", "overwrite", "text"] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            let destination = workspace.path().join("destination");
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::create_dir_all(destination.join("nested")).unwrap();
+            let file = source.join("nested/old.txt");
+            fs::write(&file, b"old").unwrap();
+            fs::write(destination.join("nested/extra.txt"), b"extra").unwrap();
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+            let operation = match kind {
+                "text" => {
+                    json!({"textDocument": {"uri": url::Url::from_file_path(&file).unwrap(), "version": null},
+                    "edits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}]})
+                }
+                "delete" => {
+                    json!({"kind": "delete", "uri": url::Url::from_file_path(&source).unwrap(), "options": {"recursive": true}})
+                }
+                _ => json!({"kind": "rename", "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(if kind == "overwrite" { destination.clone() } else { workspace.path().join("moved") }).unwrap(),
+                    "options": {"overwrite": kind == "overwrite"}}),
+            };
+            let edit = json!({"documentChanges": [operation]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let mut planned = planner.plan_workspace_edit(&edit).unwrap();
+            for entry in planned
+                .plan
+                .before_manifest
+                .iter_mut()
+                .chain(&mut planned.plan.intended_manifest)
+            {
+                if entry.resource_kind == ResourceKind::Directory {
+                    entry.content_digest = None;
+                }
+            }
+            let id = persist_test_preview(&context, workspace.path(), edit, planned);
+            let immutable =
+                serde_json::to_value(&store.read_preview(&id).unwrap().preview.plan).unwrap();
+            if kind == "text" {
+                assert_eq!(
+                    apply_preview(&mut context, &id).unwrap()["outcome"],
+                    "applied"
+                );
+                assert_eq!(fs::read(&file).unwrap(), b"new");
+            } else {
+                let failure = apply_preview(&mut context, &id).unwrap_err();
+                assert_eq!(failure.code, "preview_stale", "{kind}");
+                assert_eq!(fs::read(&file).unwrap(), b"old");
+                assert_eq!(
+                    fs::read(destination.join("nested/extra.txt")).unwrap(),
+                    b"extra"
+                );
+                assert!(store.list_transactions().unwrap().is_empty());
+                assert!(store.list_receipts().unwrap().is_empty());
+                assert_eq!(
+                    serde_json::to_value(&store.read_preview(&id).unwrap().preview.plan).unwrap(),
+                    immutable
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_membership_covers_overwritten_destination() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("old.txt"), b"source").unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        let extra = destination.join("nested/extra.txt");
+        fs::write(&extra, b"previewed").unwrap();
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let (previews, receipts, mutation) = super::super::default_mutation_settings();
+        let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+        let edit = json!({"documentChanges": [{"kind": "rename",
+            "oldUri": url::Url::from_file_path(&source).unwrap(),
+            "newUri": url::Url::from_file_path(&destination).unwrap(), "options": {"overwrite": true}}]});
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let id = persist_test_preview(
+            &context,
+            workspace.path(),
+            edit.clone(),
+            planner.plan_workspace_edit(&edit).unwrap(),
+        );
+        fs::write(&extra, b"external change").unwrap();
+        assert_eq!(
+            apply_preview(&mut context, &id).unwrap_err().code,
+            "preview_stale"
+        );
+        assert_eq!(fs::read(source.join("old.txt")).unwrap(), b"source");
+        assert_eq!(fs::read(&extra).unwrap(), b"external change");
+        assert!(store.list_transactions().unwrap().is_empty());
+        assert!(store.list_receipts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn directory_membership_intended_tree_matches_ordered_operations() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        let final_path = workspace.path().join("final");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/old.txt"), b"old").unwrap();
+        fs::write(source.join("nested/keep.txt"), b"keep").unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        fs::write(destination.join("nested/extra.txt"), b"extra").unwrap();
+        let uri = |path: &Path| url::Url::from_file_path(path).unwrap();
+        let edit = json!({"documentChanges": [
+            {"kind": "rename", "oldUri": uri(&source), "newUri": uri(&destination), "options": {"overwrite": true}},
+            {"kind": "delete", "uri": uri(&destination.join("nested/old.txt"))},
+            {"kind": "create", "uri": uri(&destination.join("nested/new.txt"))},
+            {"kind": "rename", "oldUri": uri(&destination.join("nested/keep.txt")), "newUri": uri(&destination.join("nested/renamed.txt"))},
+            {"kind": "delete", "uri": uri(&source.join("nested/old.txt")), "options": {"ignoreIfNotExists": true}},
+            {"kind": "rename", "oldUri": uri(&destination), "newUri": uri(&final_path)}
+        ]});
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let (previews, receipts, mutation) = super::super::default_mutation_settings();
+        let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let planned = planner.plan_workspace_edit(&edit).unwrap();
+        assert_eq!(planned.plan.operations.len(), 5);
+        let intended = planned.plan.intended_manifest.clone();
+        let id = persist_test_preview(&context, workspace.path(), edit, planned);
+        let first = apply_preview(&mut context, &id).unwrap();
+        assert_eq!(first["outcome"], "applied");
+        assert_eq!(
+            apply_preview(&mut context, &id).unwrap()["outcome"],
+            "already_applied"
+        );
+        assert_eq!(
+            fs::read(final_path.join("nested/renamed.txt")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(fs::read(final_path.join("nested/new.txt")).unwrap(), b"");
+        assert!(!final_path.join("nested/old.txt").exists());
+        assert!(!final_path.join("nested/extra.txt").exists());
+        assert!(!source.exists());
+        assert!(!destination.exists());
+        let observed = planner.inspect_manifest(&intended).unwrap();
+        assert!(manifest_mismatches(&intended, &observed).is_empty());
+        for entry in intended
+            .iter()
+            .filter(|entry| entry.resource_kind == ResourceKind::Directory)
+        {
+            assert!(entry.content_digest.is_some());
+        }
+        assert_eq!(store.list_receipts().unwrap().len(), 1);
+        assert!(store.list_transactions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn directory_membership_legacy_recovery_preserves_digest_vocabulary() {
+        for (committed, certified) in [(false, false), (true, false), (false, true), (true, true)] {
+            for accept in [false, true] {
+                let workspace = TempDir::new().unwrap();
+                let state = TempDir::new().unwrap();
+                let source = workspace.path().join("source");
+                let destination = workspace.path().join("destination");
+                fs::create_dir_all(source.join("nested")).unwrap();
+                fs::write(source.join("nested/old.txt"), b"old").unwrap();
+                let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+                let (previews, receipts, mutation) = super::super::default_mutation_settings();
+                let planner = WorkspaceEditPlanner::open(
+                    workspace.path(),
+                    PositionEncoding::Utf8,
+                    &previews,
+                    &mutation,
+                )
+                .unwrap();
+                let mut planned = planner
+                    .plan_workspace_edit(&json!({"documentChanges": [{"kind": "rename",
+                    "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&destination).unwrap()}]}))
+                    .unwrap();
+                for entry in planned
+                    .plan
+                    .before_manifest
+                    .iter_mut()
+                    .chain(&mut planned.plan.intended_manifest)
+                {
+                    if !certified && entry.resource_kind == ResourceKind::Directory {
+                        entry.content_digest = None;
+                    }
+                }
+                let id = store.new_transaction_id().unwrap();
+                let preview_id = store.new_preview_id().unwrap();
+                let artifact_directory = workspace.path().join(format!(".lspctl-{id}"));
+                let transaction = TransactionRecord {
+                    format_version: MUTATION_STATE_VERSION,
+                    transaction_id: id.clone(),
+                    preview_id: preview_id.clone(),
+                    receipt_id: preview_id,
+                    workspace_path: workspace.path().to_path_buf(),
+                    workspace_uri: url::Url::from_directory_path(workspace.path())
+                        .unwrap()
+                        .to_string(),
+                    state: if committed {
+                        TransactionState::Committing
+                    } else {
+                        TransactionState::Staged
+                    },
+                    started_at: now_rfc3339(),
+                    backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
+                    artifact_directory,
+                    operations: planned.plan.operations,
+                    manifest_digest: manifest_digest(&planned.plan.before_manifest),
+                    observed_manifest: planned.plan.before_manifest.clone(),
+                    before_manifest: planned.plan.before_manifest,
+                    intended_manifest: planned.plan.intended_manifest,
+                    cleanup_pending: false,
+                };
+                store.write_transaction(&transaction).unwrap();
+                stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+                if committed {
+                    commit_operations(
+                        &planner,
+                        &transaction.artifact_directory,
+                        &transaction.operations,
+                    )
+                    .unwrap();
+                }
+                let original_digest = transaction.manifest_digest.clone();
+                let reconciled =
+                    reconcile_recovery_status(&store, transaction, &previews, &mutation)
+                        .unwrap()
+                        .unwrap();
+                if !committed {
+                    assert_eq!(reconciled.manifest_digest, original_digest);
+                }
+                assert!(
+                    reconciled
+                        .observed_manifest
+                        .iter()
+                        .filter(|entry| entry.resource_kind == ResourceKind::Directory)
+                        .all(|entry| entry.content_digest.is_some() == certified)
+                );
+                let recover = || {
+                    if accept {
+                        recover_accept_current(
+                            &store,
+                            &id,
+                            &reconciled.manifest_digest,
+                            &previews,
+                            &receipts,
+                            &mutation,
+                        )
+                    } else {
+                        recover_rollback(
+                            &store,
+                            &id,
+                            &reconciled.manifest_digest,
+                            &previews,
+                            &receipts,
+                            &mutation,
+                        )
+                    }
+                };
+                if certified {
+                    let retained = if committed { &destination } else { &source };
+                    let added = retained.join("nested/added.txt");
+                    fs::write(&added, b"external").unwrap();
+                    assert_eq!(recover().unwrap_err().code, "recovery_conflict");
+                    assert_eq!(fs::read(&added).unwrap(), b"external");
+                    assert_eq!(fs::read(retained.join("nested/old.txt")).unwrap(), b"old");
+                    fs::remove_file(&added).unwrap();
+                }
+                let result = recover().unwrap();
+                assert_eq!(
+                    result["outcome"],
+                    if accept {
+                        "accepted_current"
+                    } else {
+                        "restored"
+                    }
+                );
+                let retained = if accept && committed {
+                    &destination
+                } else {
+                    &source
+                };
+                assert_eq!(fs::read(retained.join("nested/old.txt")).unwrap(), b"old");
+                let receipt = &store.list_receipts().unwrap()[0].receipt;
+                assert!(
+                    receipt
+                        .observed_manifest
+                        .iter()
+                        .filter(|entry| entry.resource_kind == ResourceKind::Directory)
+                        .all(|entry| entry.content_digest.is_some() == certified)
+                );
+                assert!(store.list_transactions().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn directory_membership_preserves_ignored_destination() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        let file = workspace.path().join("main.txt");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&file, b"old").unwrap();
+        for number in 0..5 {
+            fs::write(destination.join(format!("extra-{number}")), b"untouched").unwrap();
+        }
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let (previews, receipts, mut mutation) = super::super::default_mutation_settings();
+        mutation.max_entries = 4;
+        let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+        let uri = |path: &Path| url::Url::from_file_path(path).unwrap();
+        let edit = json!({"documentChanges": [
+            {"kind": "rename", "oldUri": uri(&source), "newUri": uri(&destination), "options": {"ignoreIfExists": true}},
+            {"textDocument": {"uri": uri(&file), "version": null}, "edits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"
+            }]}
+        ]});
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let planned = planner.plan_workspace_edit(&edit).unwrap();
+        assert_eq!(planned.plan.operations.len(), 1);
+        let id = persist_test_preview(&context, workspace.path(), edit, planned);
+        let result = apply_preview(&mut context, &id).unwrap();
+        assert_eq!(result["outcome"], "applied");
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+        for number in 0..5 {
+            assert_eq!(
+                fs::read(destination.join(format!("extra-{number}"))).unwrap(),
+                b"untouched"
+            );
+        }
+        assert!(source.is_dir());
+        assert!(store.list_transactions().unwrap().is_empty());
+    }
 
     #[test]
     fn exact_text_preview_applies_once_and_returns_same_receipt() {

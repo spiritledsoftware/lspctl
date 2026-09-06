@@ -6,7 +6,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** M
 - **Risk:** MED
@@ -177,16 +177,62 @@ Also retain the exact at-most-once Application and immutable-state fixture tests
 
 ## Done criteria
 
-- [ ] All five named `directory_membership` tests are listed and pass.
-- [ ] Full tests, Clippy, format, schema, stored-state integrity, and `git diff --check` exit 0.
-- [ ] Added/changed unpreviewed descendants cause stale rejection before a transaction is created.
-- [ ] New intended directory digests reflect the ordered final tree, and unchanged recursive Applications pass.
-- [ ] Legacy recursive Previews are not silently upgraded; immutable fixtures remain byte-identical.
-- [ ] Only in-scope files changed, and the index status is updated.
+- [x] All five named `directory_membership` tests are listed and pass.
+- [x] Full tests, Clippy, format, schema, stored-state integrity, and `git diff --check` exit 0.
+- [x] Added/changed unpreviewed descendants cause stale rejection before a transaction is created.
+- [x] New intended directory digests reflect the ordered final tree, and unchanged recursive Applications pass.
+- [x] Legacy recursive Previews are not silently upgraded; immutable fixtures remain byte-identical.
+- [x] Only in-scope files changed, and the index status is updated.
 
 ## STOP conditions
 
 STOP and report if an existing contract consumer forbids directory `contentDigest`, a safe legacy-Recovery digest projection cannot be expressed without rewriting immutable records, complete virtual membership cannot be established for a supported operation sequence, or a new schema/version/dependency appears necessary. Also STOP on unexplained drift, a gate failing twice after a reasonable fix attempt, or a required out-of-scope edit. Never weaken a check to make an old unsafe Preview apply.
+
+## Execution record — 2026-09-05
+
+Implemented on `main`, starting from clean commit `d33e9f0`. The drift check found no Mutation implementation changes from `5268c6a`; only the previously committed plan/index differed. The operator authorized implementation and a commit, not a push.
+
+- Immediate child names and resource kinds use sorted canonical JSON with the domain `lspctl-directory-membership-v1`. Enumeration uses the Workspace capability and existing no-follow checks and limits; ordinary text edits do not enumerate their parent tree.
+- Overwritten destination trees are fully bound and charged to limits. Missing-entry tombstones prevent ordered operations from reloading deleted physical resources. Intended directory digests are derived from the final virtual child sets; virtual parents permit nested resource changes after a directory rename.
+- `inspect_manifest` observes only certificate-bound directories. All five Preview proposal/presentation/Application rechecks use this observation and `preview_manifest_mismatches`; uncertified legacy recursive Previews require recreation. Ignored destination directories remain unconstrained rather than being unnecessarily enumerated.
+- Recovery chooses existing directory certificates across the journal's before/intended/observed templates. Legacy digest vocabulary remains unchanged, while certified journals reject subsequently added descendants. No schema, stored-state version, dependency, or immutable fixture changed. Post-check races and conservative rollback provenance remain plan 003 work.
+
+### Regression evidence
+
+The initial two regressions failed on the expected assertions: recursive delete applied despite an added descendant, and overwrite-rename omitted destination-only paths. Both then passed. Legacy recursive Preview rejection and legacy Recovery digest preservation each had separate red/green runs. Review reproduced an ignored-destination recheck regression, then verified the template-aware fix.
+
+`cargo test --offline --locked --bin lspctl directory_membership -- --list` lists **8 tests**, covering every required name:
+
+- Application: `directory_membership_rejects_added_descendant` — added descendants block recursive delete and source-directory rename; original/new bytes remain and no transaction or Receipt is created.
+- Planner and Application: `directory_membership_covers_overwritten_destination` — destination-only descendants and tombstones are bound and charged; changed destination-only bytes block Application.
+- Application: `directory_membership_legacy_preview_requires_recreation` — delete/rename/overwrite legacy Previews remain immutable and stale; legacy text-only Application still succeeds.
+- Application: `directory_membership_intended_tree_matches_ordered_operations` — overwrite-directory rename, nested delete/create/rename, ignored deletion of an old path, and another directory rename apply with correct final membership and one at-most-once Receipt.
+- Planner: `directory_membership_limits_and_no_follow` — overwritten destination entry/depth ceilings, affected target counts, ignored rename behavior, and no-follow checks. Linux exercised symlinks; the Windows junction branch was cross-compiled, not run locally.
+- Application: `directory_membership_legacy_recovery_preserves_digest_vocabulary` — staged/committing × accept/rollback × legacy/certified journals retain the proper digest vocabulary; certified Recovery rejects added descendants and preserves their bytes.
+- Application: `directory_membership_preserves_ignored_destination` — a mixed ignored rename plus text edit applies without enumerating the oversized untouched destination.
+
+### Final gates
+
+All commands below exited 0. Cargo commands used the existing locked dependency cache with `--offline`.
+
+| Gate | Result |
+| --- | --- |
+| `cargo test --offline --locked --bin lspctl directory_membership` | 8 passed |
+| `cargo test --offline --locked --bin lspctl mutation::` | 25 passed |
+| `cargo test --offline --locked --bin lspctl mutation::state::tests::first_release_stored_state_fixtures_remain_readable` | 1 passed |
+| `cargo test --offline --locked --all-targets --features fake-server` | 100 passed |
+| `cargo check --offline --locked --all-targets --features fake-server` | Passed |
+| Same check with `--target x86_64-pc-windows-gnu` | Passed; compile-only |
+| `cargo clippy --offline --locked --all-targets --features fake-server -- -D warnings` | Passed |
+| Same Clippy command with `--target x86_64-pc-windows-gnu` | Passed; compile-only |
+| `cargo fmt --all -- --check` | Passed |
+| `PYTHONDONTWRITEBYTECODE=1 python scripts/release/check_schema.py` | Passed |
+| `PYTHONDONTWRITEBYTECODE=1 python scripts/release/check_stored_state.py` | Passed; fixtures unchanged |
+| `git diff --check` and allowed-path check | Passed |
+
+Two-axis review against `d33e9f0`: Standards identified one fixture-setup duplication, resolved with a small test helper; Spec identified the ignored-destination compatibility defect, resolved with a regression and template-aware observation. Both independent re-reviews reported no remaining findings.
+
+**Platform follow-up:** Native Windows/macOS CI is still required. Windows cross-compilation/linting is not evidence of native filesystem behavior. No push or CI run was performed for this implementation.
 
 ## Maintenance notes
 
