@@ -892,6 +892,8 @@ fn require_manifest(
         .inspect_manifest(expected)
         .map_err(|_| "Progress resources cannot be safely inspected.".to_owned())?;
     if actual != expected {
+        #[cfg(test)]
+        eprintln!("[DEBUG-win] mismatches: expected={expected:?}, actual={actual:?}");
         return Err("Resources differ from the proven Application state.".to_owned());
     }
     Ok(())
@@ -3489,6 +3491,13 @@ mod tests {
                     "newUri": url::Url::from_file_path(&destination).unwrap(),
                     "options": {"overwrite": true}}]}),
             );
+            let original_metadata = [&source, &destination].map(|path| {
+                (
+                    path.clone(),
+                    fs::metadata(path).unwrap(),
+                    windows_security_descriptor(path).unwrap(),
+                )
+            });
             stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
             for before in transaction
                 .before_manifest
@@ -3505,7 +3514,22 @@ mod tests {
                     before.path.display()
                 );
             }
-            commit_operations(&planner, &transaction).unwrap();
+            let result = commit_operations(&planner, &transaction);
+            if result.is_err() {
+                eprintln!("[DEBUG-win] original: {original_metadata:?}");
+                let undo = undo_resource_path(
+                    &transaction.artifact_directory,
+                    operation_index(&transaction.operations[0]),
+                );
+                for path in [&source, &destination, &undo] {
+                    eprintln!(
+                        "[DEBUG-win] current {path:?}: {:?}, security={:?}",
+                        fs::metadata(path),
+                        windows_security_descriptor(path)
+                    );
+                }
+            }
+            result.unwrap();
             let restored = rollback_transaction(&transaction, &planner).unwrap();
             assert!(manifest_mismatches(&transaction.before_manifest, &restored).is_empty());
         }
