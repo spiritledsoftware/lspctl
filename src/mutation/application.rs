@@ -892,8 +892,6 @@ fn require_manifest(
         .inspect_manifest(expected)
         .map_err(|_| "Progress resources cannot be safely inspected.".to_owned())?;
     if actual != expected {
-        #[cfg(test)]
-        eprintln!("[DEBUG-win] mismatches: expected={expected:?}, actual={actual:?}");
         return Err("Resources differ from the proven Application state.".to_owned());
     }
     Ok(())
@@ -1023,11 +1021,20 @@ fn read_progress(
     Ok(progress)
 }
 
+struct MoveHandle {
+    file: File,
+    identity: String,
+    #[cfg(windows)]
+    metadata: fs::Metadata,
+    #[cfg(windows)]
+    security_descriptor: Vec<u8>,
+}
+
 fn retain_effect_handles(
     planner: &WorkspaceEditPlanner<'_>,
     operation: &CanonicalOperation,
     before: &[ManifestEntry],
-) -> Result<Vec<(File, String, fs::Metadata)>, String> {
+) -> Result<Vec<MoveHandle>, String> {
     let paths = match operation {
         CanonicalOperation::Rename {
             old_path, new_path, ..
@@ -1038,46 +1045,145 @@ fn retain_effect_handles(
     paths
         .into_iter()
         .filter(|path| manifest_for_path(before, path).is_ok_and(|entry| entry.exists))
-        .map(|path| {
-            let expected = manifest_for_path(before, path)?;
-            let file = open_move_handle(planner, path)?;
-            let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
-            if expected.identity_digest.as_deref() != Some(&identity) {
-                return Err("Resource handle differs from commit preconditions.".to_owned());
-            }
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            Ok((file, identity, metadata))
-        })
+        .map(|path| retain_move_handle(planner, manifest_for_path(before, path)?))
         .collect()
 }
 
-fn open_move_handle(planner: &WorkspaceEditPlanner<'_>, path: &Path) -> Result<File, String> {
+fn retain_move_handle(
+    planner: &WorkspaceEditPlanner<'_>,
+    expected: &ManifestEntry,
+) -> Result<MoveHandle, String> {
     let mut options = CapabilityOpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt;
         use windows_sys::Win32::{
-            Foundation::GENERIC_READ,
-            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES},
+            Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+            System::SystemServices::MAXIMUM_ALLOWED,
         };
-        // Observation handles must allow rename. A Dir capability deliberately denies share-delete.
+        // Keep share-delete enabled. MAXIMUM_ALLOWED makes SetSecurityInfo non-propagating:
+        // restoring the moved root's DACL must not rewrite its children's descriptors.
         options
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+            .access_mode(MAXIMUM_ALLOWED);
     }
-    planner
+    let file = planner
         .capability_root()
-        .open_with(planner.relative_path(path)?, &options)
-        .map(|file| file.into_std())
-        .map_err(|e| e.to_string())
+        .open_with(planner.relative_path(&expected.path)?, &options)
+        .map_err(|e| e.to_string())?
+        .into_std();
+    let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
+    if expected.identity_digest.as_deref() != Some(&identity) {
+        return Err("Resource handle differs from commit preconditions.".to_owned());
+    }
+    Ok(MoveHandle {
+        identity,
+        #[cfg(windows)]
+        metadata: file.metadata().map_err(|e| e.to_string())?,
+        #[cfg(windows)]
+        security_descriptor: move_security_descriptor(&file).map_err(|e| e.to_string())?,
+        file,
+    })
 }
 
 #[cfg(windows)]
-fn preserve_creation_time(file: &File, metadata: &fs::Metadata) -> std::io::Result<()> {
-    use std::os::windows::fs::FileTimesExt;
-    // NTFS tunneling can assign a recently vacated destination's creation time during rename.
-    file.set_times(fs::FileTimes::new().set_created(metadata.created()?))
+fn move_security_descriptor(file: &File) -> std::io::Result<Vec<u8>> {
+    use std::{os::windows::io::AsRawHandle, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorLength,
+            OWNER_SECURITY_INFORMATION,
+        },
+    };
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    let bytes = if length == 0 {
+        Err(std::io::Error::other(
+            "The move security descriptor is empty.",
+        ))
+    } else {
+        Ok(unsafe { slice::from_raw_parts(descriptor.cast::<u8>(), length) }.to_vec())
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    bytes
+}
+
+#[cfg(windows)]
+fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
+    use std::{
+        os::windows::{fs::FileTimesExt, io::AsRawHandle},
+        ptr,
+    };
+    use windows_sys::Win32::Security::{
+        Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+    };
+    // NTFS can change creation time and inherited ACE flags when moving into the private undo dir.
+    handle
+        .file
+        .set_times(fs::FileTimes::new().set_created(handle.metadata.created()?))?;
+    if move_security_descriptor(&handle.file)? == handle.security_descriptor {
+        return Ok(());
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = ptr::null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            handle.security_descriptor.as_ptr().cast_mut().cast(),
+            &mut present,
+            &mut dacl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if present == 0 {
+        return Err(std::io::Error::other(
+            "The move security descriptor has no DACL.",
+        ));
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    if move_security_descriptor(&handle.file)? != handle.security_descriptor {
+        return Err(std::io::Error::other(
+            "The moved security descriptor could not be preserved.",
+        ));
+    }
+    Ok(())
 }
 
 fn operation_after(
@@ -1313,12 +1419,12 @@ fn commit_operations_with_writer(
                 )
                 .map(|()| None),
             }?;
-            for (file, identity, _metadata) in &retained {
-                if open_file_identity(file).map_err(|e| e.to_string())? != *identity {
+            for handle in &retained {
+                if open_file_identity(&handle.file).map_err(|e| e.to_string())? != handle.identity {
                     return Err("A moved resource handle changed.".to_owned());
                 }
                 #[cfg(windows)]
-                preserve_creation_time(file, _metadata).map_err(|e| e.to_string())?;
+                preserve_move_metadata(handle).map_err(|e| e.to_string())?;
             }
             let observed = planner
                 .inspect_manifest(&expected)
@@ -2160,23 +2266,11 @@ fn rename_capability_resource(
     // Each leg needs a fresh check: the previous rename and its flush can admit an external writer.
     require_manifest(planner, &expected)?;
     #[cfg(windows)]
-    let (handle, metadata) = {
-        let file = open_move_handle(planner, from)?;
-        if open_file_identity(&file).map_err(|e| e.to_string())?
-            != manifest_for_path(proof, from)?
-                .identity_digest
-                .as_deref()
-                .ok_or("Missing move identity.")?
-        {
-            return Err("The rollback rename source changed.".to_owned());
-        }
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
-        (file, metadata)
-    };
+    let handle = retain_move_handle(planner, manifest_for_path(proof, from)?)?;
     root.rename(from_relative, root, to_relative)
         .map_err(|error| error.to_string())?;
     #[cfg(windows)]
-    preserve_creation_time(&handle, &metadata).map_err(|e| e.to_string())?;
+    preserve_move_metadata(&handle).map_err(|e| e.to_string())?;
     flush_parent(from).map_err(|error| error.to_string())?;
     if from.parent() != to.parent() {
         flush_parent(to).map_err(|error| error.to_string())?;
@@ -3491,13 +3585,6 @@ mod tests {
                     "newUri": url::Url::from_file_path(&destination).unwrap(),
                     "options": {"overwrite": true}}]}),
             );
-            let original_metadata = [&source, &destination].map(|path| {
-                (
-                    path.clone(),
-                    fs::metadata(path).unwrap(),
-                    windows_security_descriptor(path).unwrap(),
-                )
-            });
             stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
             for before in transaction
                 .before_manifest
@@ -3514,22 +3601,7 @@ mod tests {
                     before.path.display()
                 );
             }
-            let result = commit_operations(&planner, &transaction);
-            if result.is_err() {
-                eprintln!("[DEBUG-win] original: {original_metadata:?}");
-                let undo = undo_resource_path(
-                    &transaction.artifact_directory,
-                    operation_index(&transaction.operations[0]),
-                );
-                for path in [&source, &destination, &undo] {
-                    eprintln!(
-                        "[DEBUG-win] current {path:?}: {:?}, security={:?}",
-                        fs::metadata(path),
-                        windows_security_descriptor(path)
-                    );
-                }
-            }
-            result.unwrap();
+            commit_operations(&planner, &transaction).unwrap();
             let restored = rollback_transaction(&transaction, &planner).unwrap();
             assert!(manifest_mismatches(&transaction.before_manifest, &restored).is_empty());
         }
