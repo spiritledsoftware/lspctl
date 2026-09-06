@@ -1025,8 +1025,6 @@ struct MoveHandle {
     file: File,
     identity: String,
     #[cfg(windows)]
-    metadata: fs::Metadata,
-    #[cfg(windows)]
     security_descriptor: Vec<u8>,
 }
 
@@ -1059,14 +1057,13 @@ fn retain_move_handle(
     {
         use cap_std::fs::OpenOptionsExt;
         use windows_sys::Win32::{
-            Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
-            System::SystemServices::MAXIMUM_ALLOWED,
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, WRITE_DAC},
         };
-        // Keep share-delete enabled. MAXIMUM_ALLOWED makes SetSecurityInfo non-propagating:
-        // restoring the moved root's DACL must not rewrite its children's descriptors.
+        // Keep share-delete enabled while retaining the right to restore the moved root's DACL.
         options
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .access_mode(MAXIMUM_ALLOWED);
+            .access_mode(GENERIC_READ | WRITE_DAC);
     }
     let file = planner
         .capability_root()
@@ -1079,8 +1076,6 @@ fn retain_move_handle(
     }
     Ok(MoveHandle {
         identity,
-        #[cfg(windows)]
-        metadata: file.metadata().map_err(|e| e.to_string())?,
         #[cfg(windows)]
         security_descriptor: move_security_descriptor(&file).map_err(|e| e.to_string())?,
         file,
@@ -1129,28 +1124,17 @@ fn move_security_descriptor(file: &File) -> std::io::Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
-    use std::{
-        os::windows::{fs::FileTimesExt, io::AsRawHandle},
-        ptr,
-    };
+fn without_inherited_ace_flags(mut descriptor: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    use std::ptr;
     use windows_sys::Win32::Security::{
-        Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        ACE_HEADER, GetAce, GetSecurityDescriptorDacl, INHERITED_ACE,
     };
-    // NTFS can change creation time and inherited ACE flags when moving into the private undo dir.
-    handle
-        .file
-        .set_times(fs::FileTimes::new().set_created(handle.metadata.created()?))?;
-    if move_security_descriptor(&handle.file)? == handle.security_descriptor {
-        return Ok(());
-    }
     let mut present = 0;
     let mut defaulted = 0;
     let mut dacl = ptr::null_mut();
     if unsafe {
         GetSecurityDescriptorDacl(
-            handle.security_descriptor.as_ptr().cast_mut().cast(),
+            descriptor.as_mut_ptr().cast(),
             &mut present,
             &mut dacl,
             &mut defaulted,
@@ -1159,24 +1143,48 @@ fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
     {
         return Err(std::io::Error::last_os_error());
     }
-    if present == 0 {
+    if present != 0 && !dacl.is_null() {
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Descriptors come directly from GetSecurityInfo, and GetAce locates each header.
+            unsafe {
+                (*ace.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8);
+            }
+        }
+    }
+    Ok(descriptor)
+}
+
+#[cfg(windows)]
+fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
+    let current = move_security_descriptor(&handle.file)?;
+    if current == handle.security_descriptor {
+        return Ok(());
+    }
+    if without_inherited_ace_flags(current)?
+        != without_inherited_ace_flags(handle.security_descriptor.clone())?
+    {
         return Err(std::io::Error::other(
-            "The move security descriptor has no DACL.",
+            "The moved security descriptor changed externally.",
         ));
     }
-    let status = unsafe {
-        SetSecurityInfo(
+    // Narrow legacy API exception: SetSecurityInfo recomputes inheritance on filesystem objects.
+    // Only the proven INHERITED_ACE-bit rewrite may be undone, through this retained handle,
+    // without propagating the root's ACL to children or changing any other descriptor bytes.
+    if unsafe {
+        SetKernelObjectSecurity(
             handle.file.as_raw_handle(),
-            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            dacl,
-            ptr::null_mut(),
+            handle.security_descriptor.as_ptr().cast_mut().cast(),
         )
-    };
-    if status != 0 {
-        return Err(std::io::Error::from_raw_os_error(status as i32));
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     if move_security_descriptor(&handle.file)? != handle.security_descriptor {
         return Err(std::io::Error::other(
@@ -3542,6 +3550,109 @@ mod tests {
         );
         assert!(!target.exists());
         assert!(store.list_receipts().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_provenance_windows_preserves_external_acl_change() {
+        use std::{os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Security::{
+                ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, GetAce,
+                GetSecurityDescriptorDacl, SetKernelObjectSecurity,
+            },
+            Storage::FileSystem::FILE_WRITE_DATA,
+            System::SystemServices::ACCESS_ALLOWED_ACE_TYPE,
+        };
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        fs::write(&source, b"preserve these bytes").unwrap();
+        let (previews, _, mutation) = super::super::default_mutation_settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let transaction = provenance_transaction(
+            workspace.path(),
+            &planner,
+            json!({"documentChanges": [{"kind": "delete", "uri": url::Url::from_file_path(&source).unwrap()}]}),
+        );
+        stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+        let handle = retain_move_handle(
+            &planner,
+            manifest_for_path(&transaction.before_manifest, &source).unwrap(),
+        )
+        .unwrap();
+        let undo = undo_resource_path(
+            &transaction.artifact_directory,
+            operation_index(&transaction.operations[0]),
+        );
+        planner
+            .capability_root()
+            .rename(
+                planner.relative_path(&source).unwrap(),
+                planner.capability_root(),
+                planner.relative_path(&undo).unwrap(),
+            )
+            .unwrap();
+
+        // Change an actual permission, not the inheritance marker altered by the move.
+        let mut external = move_security_descriptor(&handle.file).unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    external.as_mut_ptr().cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let mut changed = false;
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+            if u32::from(unsafe { (*ace.cast::<ACE_HEADER>()).AceType }) == ACCESS_ALLOWED_ACE_TYPE
+            {
+                unsafe {
+                    (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask ^= FILE_WRITE_DATA;
+                }
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "the isolated file must have an allowed ACE");
+        assert_ne!(
+            unsafe {
+                SetKernelObjectSecurity(
+                    handle.file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION,
+                    external.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+        let external = move_security_descriptor(&handle.file).unwrap();
+        assert_ne!(
+            without_inherited_ace_flags(external.clone()).unwrap(),
+            without_inherited_ace_flags(handle.security_descriptor.clone()).unwrap()
+        );
+        let observed = inspect_manifest_path(&planner, &undo).unwrap();
+
+        assert!(preserve_move_metadata(&handle).is_err());
+        assert_eq!(move_security_descriptor(&handle.file).unwrap(), external);
+        assert_eq!(inspect_manifest_path(&planner, &undo).unwrap(), observed);
+        assert_eq!(fs::read(&undo).unwrap(), b"preserve these bytes");
+        assert!(transaction.artifact_directory.exists());
     }
 
     #[cfg(windows)]
