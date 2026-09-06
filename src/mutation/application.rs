@@ -1026,6 +1026,8 @@ struct MoveHandle {
     identity: String,
     #[cfg(windows)]
     security_descriptor: Vec<u8>,
+    #[cfg(windows)]
+    created: std::time::SystemTime,
 }
 
 fn retain_effect_handles(
@@ -1058,12 +1060,12 @@ fn retain_move_handle(
         use cap_std::fs::OpenOptionsExt;
         use windows_sys::Win32::{
             Foundation::GENERIC_READ,
-            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, WRITE_DAC},
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, WRITE_DAC},
         };
         // Keep share-delete enabled while retaining the right to restore the moved root's DACL.
         options
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .access_mode(GENERIC_READ | WRITE_DAC);
+            .access_mode(GENERIC_READ | WRITE_DAC | FILE_WRITE_ATTRIBUTES);
     }
     let file = planner
         .capability_root()
@@ -1078,6 +1080,11 @@ fn retain_move_handle(
         identity,
         #[cfg(windows)]
         security_descriptor: move_security_descriptor(&file).map_err(|e| e.to_string())?,
+        #[cfg(windows)]
+        created: file
+            .metadata()
+            .and_then(|metadata| metadata.created())
+            .map_err(|e| e.to_string())?,
         file,
     })
 }
@@ -1160,14 +1167,13 @@ fn without_inherited_ace_flags(mut descriptor: Vec<u8>) -> std::io::Result<Vec<u
 
 #[cfg(windows)]
 fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::{fs::FileTimesExt, io::AsRawHandle};
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
     let current = move_security_descriptor(&handle.file)?;
-    if current == handle.security_descriptor {
-        return Ok(());
-    }
-    if without_inherited_ace_flags(current)?
-        != without_inherited_ace_flags(handle.security_descriptor.clone())?
+    let changed = current != handle.security_descriptor;
+    if changed
+        && without_inherited_ace_flags(current)?
+            != without_inherited_ace_flags(handle.security_descriptor.clone())?
     {
         return Err(std::io::Error::other(
             "The moved security descriptor changed externally.",
@@ -1176,13 +1182,14 @@ fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
     // Narrow legacy API exception: SetSecurityInfo recomputes inheritance on filesystem objects.
     // Only the proven INHERITED_ACE-bit rewrite may be undone, through this retained handle,
     // without propagating the root's ACL to children or changing any other descriptor bytes.
-    if unsafe {
-        SetKernelObjectSecurity(
-            handle.file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
-            handle.security_descriptor.as_ptr().cast_mut().cast(),
-        )
-    } == 0
+    if changed
+        && unsafe {
+            SetKernelObjectSecurity(
+                handle.file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                handle.security_descriptor.as_ptr().cast_mut().cast(),
+            )
+        } == 0
     {
         return Err(std::io::Error::last_os_error());
     }
@@ -1191,7 +1198,11 @@ fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
             "The moved security descriptor could not be preserved.",
         ));
     }
-    Ok(())
+    // NTFS tunneling can copy the vacated destination's creation time onto a renamed file.
+    // Restore the time captured from the moved handle only after rejecting unrelated ACL changes.
+    handle
+        .file
+        .set_times(fs::FileTimes::new().set_created(handle.created))
 }
 
 fn operation_after(
