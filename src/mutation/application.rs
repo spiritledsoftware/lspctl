@@ -26,7 +26,7 @@ use crate::{
 use super::{
     planner::{
         CanonicalOperation, CanonicalPlan, ManifestEntry, ResourceKind, WorkspaceEditPlanner,
-        WorkspaceEditProblem, open_file_identity,
+        WorkspaceEditProblem, missing_manifest, open_file_identity,
     },
     state::{
         BackupEntry, MUTATION_STATE_VERSION, MutationStateStore, ReceiptRecord, StoredPreview,
@@ -778,22 +778,11 @@ fn operation_index(operation: &CanonicalOperation) -> u64 {
     }
 }
 
-fn missing_entry(path: &Path) -> ManifestEntry {
-    ManifestEntry {
-        path: path.to_path_buf(),
-        exists: false,
-        resource_kind: ResourceKind::Missing,
-        identity_digest: None,
-        content_digest: None,
-        metadata_digest: None,
-    }
-}
-
 fn initial_progress_manifest(transaction: &TransactionRecord) -> Vec<ManifestEntry> {
     let mut entries = transaction
         .intended_manifest
         .iter()
-        .map(|entry| (entry.path.clone(), missing_entry(&entry.path)))
+        .map(|entry| (entry.path.clone(), missing_manifest(&entry.path)))
         .collect::<BTreeMap<_, _>>();
     entries.extend(
         transaction
@@ -878,7 +867,7 @@ fn add_undo_manifest(
     let missing = entries
         .iter()
         .filter(|entry| entry.path.starts_with(path))
-        .map(|entry| missing_entry(&translated_path(&entry.path, path, &undo)))
+        .map(|entry| missing_manifest(&translated_path(&entry.path, path, &undo)))
         .collect::<Vec<_>>();
     entries.extend(missing);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1327,7 +1316,7 @@ fn transfer_manifest(
         if entry.resource_kind == ResourceKind::Directory && entry.content_digest.is_none() {
             return Err("Directory transfer lacks a membership certificate.".to_owned());
         }
-        entries.insert(entry.path.clone(), missing_entry(&entry.path));
+        entries.insert(entry.path.clone(), missing_manifest(&entry.path));
         let path = translated_path(&entry.path, from, to);
         let mut moved = entry;
         moved.path = path.clone();
@@ -1482,18 +1471,17 @@ fn apply_text_operation(
         .read(true)
         .write(true)
         .follow(FollowSymlinks::No);
-    let mut source = planner
+    let mut file = planner
         .capability_root()
         .open_with(relative, &read_options)
-        .map_err(|error| error.to_string())?;
-    let accessed = source
+        .map_err(|error| error.to_string())?
+        .into_std();
+    let accessed = file
         .metadata()
         .and_then(|metadata| metadata.accessed())
-        .map_err(|error| format!("The text resource access time cannot be inspected: {error}"))?
-        .into_std();
+        .map_err(|error| format!("The text resource access time cannot be inspected: {error}"))?;
     let mut bytes = Vec::new();
-    source
-        .read_to_end(&mut bytes)
+    file.read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     if digest_raw_bytes(&bytes) != before_digest {
         return Err("Text resource changed during commit.".to_owned());
@@ -1503,8 +1491,7 @@ fn apply_text_operation(
     if digest_raw_bytes(&result) != after_digest {
         return Err("Canonical text edit digest does not match.".to_owned());
     }
-    let identity = open_file_identity(&source.try_clone().map_err(|e| e.to_string())?.into_std())
-        .map_err(|e| e.to_string())?;
+    let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
     if expected_identity != Some(identity.as_str())
         || inspect_manifest_path(planner, path)?
             .identity_digest
@@ -1513,13 +1500,11 @@ fn apply_text_operation(
     {
         return Err("Text resource was replaced before truncation.".to_owned());
     }
-    let mut file = source;
     file.set_len(0).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&result))
         .and_then(|_| file.sync_all())
         .map_err(|error| error.to_string())?;
-    let file = file.into_std();
     file.set_times(std::fs::FileTimes::new().set_accessed(accessed))
         .and_then(|()| file.sync_all())
         .map_err(|error| error.to_string())?;
@@ -2280,7 +2265,7 @@ fn rename_capability_resource(
         .filter(|entry| entry.path.starts_with(from))
         .cloned()
         .collect::<Vec<_>>();
-    expected.push(missing_entry(to));
+    expected.push(missing_manifest(to));
     expected.sort_by(|a, b| a.path.cmp(&b.path));
     // Each leg needs a fresh check: the previous rename and its flush can admit an external writer.
     require_manifest(planner, &expected)?;

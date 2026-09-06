@@ -1942,7 +1942,7 @@ fn missing_resource(path: &Path) -> ResourceState {
     }
 }
 
-fn missing_manifest(path: &Path) -> ManifestEntry {
+pub(super) fn missing_manifest(path: &Path) -> ManifestEntry {
     ManifestEntry {
         path: path.to_path_buf(),
         exists: false,
