@@ -6,7 +6,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** L
 - **Risk:** HIGH
@@ -179,17 +179,45 @@ The seven required `rollback_provenance_*` tests above cover untouched external 
 
 ## Done criteria
 
-- [ ] All seven named regression tests are listed and pass; no zero-test filtered runs.
-- [ ] An unwritten external text change and an uncreated external file both survive failed Application and explicit Recovery attempts.
-- [ ] Completed ordinary Application effects still roll back successfully when unchanged externally.
-- [ ] Simulated crash gaps never become permission for destructive guessed restoration.
-- [ ] New progress data is bounded and validated; legacy v1 records/immutable fixtures remain readable and unchanged.
-- [ ] Full tests, Clippy, format, schema, fixture, and diff checks exit 0.
-- [ ] Only allowed paths changed and index row 003 is updated.
+- [x] All seven named regression tests are listed and pass; no zero-test filtered runs.
+- [x] An unwritten external text change and an uncreated external file both survive failed Application and explicit Recovery attempts.
+- [x] Completed ordinary Application effects still roll back successfully when unchanged externally.
+- [x] Simulated crash gaps never become permission for destructive guessed restoration.
+- [x] New progress data is bounded and validated; legacy v1 records/immutable fixtures remain readable and unchanged.
+- [x] Full tests, Clippy, format, schema, fixture, and diff checks exit 0.
+- [x] Only allowed paths changed and index row 003 is updated.
 
 ## STOP conditions
 
 STOP if plan 002 is not complete, resource identity cannot be tied to the mutated handle, safe sidecar validation requires a public format change, a supported ordered sequence cannot be rolled back without guessing, or the proposed solution relies solely on a numeric completed-operation count. STOP rather than implementing a second general transaction framework. Also STOP on unexplained drift, two failed verification attempts, or required out-of-scope edits. Do not resolve a conflict by deleting user bytes or refreshing immutable fixtures.
+
+## Completion evidence — 2026-09-06
+
+Implemented for #39 from `230891f`, retaining plan 002's directory certificates and existing regression assertions. The operator explicitly authorized continuing after the verification-failure STOP and requested a commit on the current branch. No other safety STOP was waived.
+
+A private, bounded progress sidecar binds ordered before/after effect evidence to the transaction, canonical operations, and original manifest. Pending or invalid evidence does not authorize destructive undo. Rollback preflights the full reverse chain and revalidates each destructive step, including both legs of overwrite-rename undo. Workspace write stops and artifacts remain when external changes prevent exact restoration.
+
+**Compatibility restriction:** legacy v1 journals remain readable and support status and `accept-current`. Without provenance, rollback succeeds only when the complete before-manifest already matches; otherwise it refuses safely instead of restoring guessed state. No public schema or immutable stored-state fixture changed. Snapshot evidence has a documented quadratic operation-count storage ceiling; future changed-resource-only proofs are deferred.
+
+Native verification: **Linux x86_64 only**. Windows/macOS runtime validation remains for CI.
+
+| Gate | Result |
+| --- | --- |
+| `cargo check --locked --all-targets --features fake-server` | Passed |
+| `cargo test --locked --bin lspctl rollback_provenance -- --list` | All seven required names plus the review regression listed (8 total) |
+| `cargo test --locked --bin lspctl rollback_provenance` | 8 passed |
+| Each unique progress round-trip and uncertain-commit test filter | 1 passed per filter |
+| `cargo test --locked --bin lspctl mutation::application::tests` | 20 passed |
+| `cargo test --locked --bin lspctl mutation::` | 33 passed |
+| `cargo test --locked --bin lspctl mutation::state::tests::first_release_stored_state_fixtures_remain_readable` | 1 passed |
+| `cargo test --locked --all-targets --features fake-server` | 108 passed across all targets |
+| `cargo clippy --locked --all-targets --features fake-server -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `python scripts/release/check_schema.py` | Passed |
+| `python scripts/release/check_stored_state.py` | Passed |
+| `git diff --check` | Passed |
+
+The three initial preservation regressions failed on destructive rollback before the fix. Two-axis review: Standards found no violations; Spec found one missing revalidation between overwrite-rename rollback legs. The additional deterministic `rollback_provenance_rechecks_each_rename_leg` regression failed before its fix and now passes for an externally occupied destination and externally edited undo resource. Follow-up review confirmed the finding resolved, with no outstanding findings.
 
 ## Maintenance notes
 

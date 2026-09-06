@@ -2120,6 +2120,37 @@ fn identity_digest(
     ))
 }
 
+/// Identity from the actual no-follow handle retained across an Application effect.
+pub(super) fn open_file_identity(file: &File) -> std::io::Result<String> {
+    let mut identity = json!({});
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        identity["device"] = json!(metadata.dev());
+        identity["inode"] = json!(metadata.ino());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        identity["volumeSerial"] = json!(information.dwVolumeSerialNumber);
+        identity["fileIndex"] = json!(
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow)
+        );
+    }
+    Ok(digest_canonical_value(
+        "lspctl-resource-identity-v1",
+        &identity,
+    ))
+}
+
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
     let information = windows_file_information(path)?;
