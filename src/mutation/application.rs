@@ -1025,7 +1025,7 @@ fn retain_effect_handles(
     planner: &WorkspaceEditPlanner<'_>,
     operation: &CanonicalOperation,
     before: &[ManifestEntry],
-) -> Result<Vec<(File, String)>, String> {
+) -> Result<Vec<(File, String, fs::Metadata)>, String> {
     let paths = match operation {
         CanonicalOperation::Rename {
             old_path, new_path, ..
@@ -1038,29 +1038,44 @@ fn retain_effect_handles(
         .filter(|path| manifest_for_path(before, path).is_ok_and(|entry| entry.exists))
         .map(|path| {
             let expected = manifest_for_path(before, path)?;
-            let relative = planner.relative_path(path)?;
-            let file = if expected.resource_kind == ResourceKind::Directory {
-                planner
-                    .capability_root()
-                    .open_dir_nofollow(relative)
-                    .map_err(|e| e.to_string())?
-                    .into_std_file()
-            } else {
-                let mut options = CapabilityOpenOptions::new();
-                options.read(true).follow(FollowSymlinks::No);
-                planner
-                    .capability_root()
-                    .open_with(relative, &options)
-                    .map_err(|e| e.to_string())?
-                    .into_std()
-            };
+            let file = open_move_handle(planner, path)?;
             let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
             if expected.identity_digest.as_deref() != Some(&identity) {
                 return Err("Resource handle differs from commit preconditions.".to_owned());
             }
-            Ok((file, identity))
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            Ok((file, identity, metadata))
         })
         .collect()
+}
+
+fn open_move_handle(planner: &WorkspaceEditPlanner<'_>, path: &Path) -> Result<File, String> {
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES},
+        };
+        // Observation handles must allow rename. A Dir capability deliberately denies share-delete.
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+    }
+    planner
+        .capability_root()
+        .open_with(planner.relative_path(path)?, &options)
+        .map(|file| file.into_std())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn preserve_creation_time(file: &File, metadata: &fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTimesExt;
+    // NTFS tunneling can assign a recently vacated destination's creation time during rename.
+    file.set_times(fs::FileTimes::new().set_created(metadata.created()?))
 }
 
 fn operation_after(
@@ -1219,116 +1234,90 @@ fn commit_operations_with_writer(
     let mut expected = initial_progress_manifest(transaction);
     for operation in &transaction.operations {
         let index = operation_index(operation);
-        let mut prepare = || -> Result<Vec<ManifestEntry>, String> {
+        let result = (|| -> Result<(), String> {
             add_undo_manifest(&mut expected, transaction, operation);
             require_manifest(planner, &expected)?;
-            Ok(expected.clone())
-        };
-        let before = prepare().map_err(|reason| CommitFailure {
-            operation_index: index,
-            _reason: reason,
-        })?;
-        progress.effects.push(CommitEffect {
-            index,
-            before,
-            after: None,
-        });
-        persist(&progress).map_err(|reason| CommitFailure {
-            operation_index: index,
-            _reason: reason,
-        })?;
-        let retained = retain_effect_handles(planner, operation, &expected).map_err(|reason| {
-            CommitFailure {
-                operation_index: index,
-                _reason: reason,
+            progress.effects.push(CommitEffect {
+                index,
+                before: expected.clone(),
+                after: None,
+            });
+            persist(&progress)?;
+            let retained = retain_effect_handles(planner, operation, &expected)?;
+            let identity = match operation {
+                CanonicalOperation::Text {
+                    index,
+                    path,
+                    before_digest,
+                    after_digest,
+                    ..
+                } => apply_text_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    path,
+                    before_digest,
+                    after_digest,
+                    manifest_for_path(&expected, path)
+                        .unwrap()
+                        .identity_digest
+                        .as_deref(),
+                ),
+                CanonicalOperation::Create {
+                    path,
+                    overwrite,
+                    ignore_if_exists,
+                    ..
+                } => apply_create_operation(
+                    planner,
+                    path,
+                    *overwrite,
+                    *ignore_if_exists,
+                    manifest_for_path(&expected, path)
+                        .unwrap()
+                        .identity_digest
+                        .as_deref(),
+                ),
+                CanonicalOperation::Rename {
+                    index,
+                    old_path,
+                    new_path,
+                    overwrite,
+                    ignore_if_exists,
+                    ..
+                } => apply_rename_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    old_path,
+                    new_path,
+                    *overwrite,
+                    *ignore_if_exists,
+                )
+                .map(|()| None),
+                CanonicalOperation::Delete {
+                    index,
+                    path,
+                    recursive,
+                    ignore_if_not_exists,
+                    ..
+                } => apply_delete_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    path,
+                    *recursive,
+                    *ignore_if_not_exists,
+                )
+                .map(|()| None),
+            }?;
+            for (file, identity, _metadata) in &retained {
+                if open_file_identity(file).map_err(|e| e.to_string())? != *identity {
+                    return Err("A moved resource handle changed.".to_owned());
+                }
+                #[cfg(windows)]
+                preserve_creation_time(file, _metadata).map_err(|e| e.to_string())?;
             }
-        })?;
-        let result = match operation {
-            CanonicalOperation::Text {
-                index,
-                path,
-                before_digest,
-                after_digest,
-                ..
-            } => apply_text_operation(
-                planner,
-                artifact_directory,
-                *index,
-                path,
-                before_digest,
-                after_digest,
-                manifest_for_path(&expected, path)
-                    .unwrap()
-                    .identity_digest
-                    .as_deref(),
-            )
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-            CanonicalOperation::Create {
-                index,
-                path,
-                overwrite,
-                ignore_if_exists,
-                ..
-            } => apply_create_operation(
-                planner,
-                path,
-                *overwrite,
-                *ignore_if_exists,
-                manifest_for_path(&expected, path)
-                    .unwrap()
-                    .identity_digest
-                    .as_deref(),
-            )
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-            CanonicalOperation::Rename {
-                index,
-                old_path,
-                new_path,
-                overwrite,
-                ignore_if_exists,
-                ..
-            } => apply_rename_operation(
-                planner,
-                artifact_directory,
-                *index,
-                old_path,
-                new_path,
-                *overwrite,
-                *ignore_if_exists,
-            )
-            .map(|()| None)
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-            CanonicalOperation::Delete {
-                index,
-                path,
-                recursive,
-                ignore_if_not_exists,
-                ..
-            } => apply_delete_operation(
-                planner,
-                artifact_directory,
-                *index,
-                path,
-                *recursive,
-                *ignore_if_not_exists,
-            )
-            .map(|()| None)
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-        };
-        let identity = result?;
-        let completed = (|| -> Result<(), String> {
             let observed = planner
                 .inspect_manifest(&expected)
                 .map_err(|problems| format!("Commit evidence cannot be inspected: {problems:?}"))?;
@@ -1339,16 +1328,11 @@ fn commit_operations_with_writer(
                 &observed,
                 identity.as_deref(),
             )?;
-            for (file, identity) in &retained {
-                if open_file_identity(file).map_err(|e| e.to_string())? != *identity {
-                    return Err("A moved resource handle changed.".to_owned());
-                }
-            }
             require_manifest(planner, &expected)?;
             progress.effects.last_mut().unwrap().after = Some(expected.clone());
             persist(&progress)
         })();
-        completed.map_err(|reason| CommitFailure {
+        result.map_err(|reason| CommitFailure {
             operation_index: index,
             _reason: reason,
         })?;
@@ -2173,8 +2157,24 @@ fn rename_capability_resource(
     expected.sort_by(|a, b| a.path.cmp(&b.path));
     // Each leg needs a fresh check: the previous rename and its flush can admit an external writer.
     require_manifest(planner, &expected)?;
+    #[cfg(windows)]
+    let (handle, metadata) = {
+        let file = open_move_handle(planner, from)?;
+        if open_file_identity(&file).map_err(|e| e.to_string())?
+            != manifest_for_path(proof, from)?
+                .identity_digest
+                .as_deref()
+                .ok_or("Missing move identity.")?
+        {
+            return Err("The rollback rename source changed.".to_owned());
+        }
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        (file, metadata)
+    };
     root.rename(from_relative, root, to_relative)
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    preserve_creation_time(&handle, &metadata).map_err(|e| e.to_string())?;
     flush_parent(from).map_err(|error| error.to_string())?;
     if from.parent() != to.parent() {
         flush_parent(to).map_err(|error| error.to_string())?;
@@ -2202,6 +2202,11 @@ fn preserve_open_file_metadata(
     let times = fs::FileTimes::new()
         .set_accessed(metadata.accessed()?)
         .set_modified(metadata.modified()?);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(metadata.created()?)
+    };
     destination.set_times(times)
 }
 
@@ -2435,26 +2440,27 @@ fn copy_native_flags(
 }
 
 fn copy_file_times(destination: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
-    #[cfg(windows)]
-    if metadata.is_dir() {
-        // Opening directories for timestamp updates requires
-        // FILE_FLAG_BACKUP_SEMANTICS; directory timestamps are not part of
-        // the v1 Mutation metadata digest on Windows.
-        return Ok(());
-    }
     let times = std::fs::FileTimes::new()
         .set_accessed(metadata.accessed()?)
         .set_modified(metadata.modified()?);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(metadata.created()?)
+    };
     open_file_for_timestamp_update(destination)?.set_times(times)
 }
 
 #[cfg(windows)]
 fn open_file_for_timestamp_update(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
 
     fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }
 
@@ -3440,6 +3446,69 @@ mod tests {
         );
         assert!(!target.exists());
         assert!(store.list_receipts().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_provenance_windows_preserves_copy_and_move_metadata() {
+        use std::{os::windows::fs::FileTimesExt, time::SystemTime};
+
+        for directory in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            let destination = workspace.path().join("destination");
+            for (path, seconds) in [(&source, 946_684_800), (&destination, 1_262_304_000)] {
+                if directory {
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("child"), b"content").unwrap();
+                } else {
+                    fs::write(path, b"content").unwrap();
+                }
+                // Distinct known creation times expose both copy loss and NTFS rename tunneling.
+                open_file_for_timestamp_update(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_created(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [{"kind": "rename",
+                    "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&destination).unwrap(),
+                    "options": {"overwrite": true}}]}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            for before in transaction
+                .before_manifest
+                .iter()
+                .filter(|entry| entry.exists)
+            {
+                let backup = backup_path_for(&transaction.backups, &before.path).unwrap();
+                assert_eq!(
+                    inspect_manifest_path(&planner, &backup)
+                        .unwrap()
+                        .metadata_digest,
+                    before.metadata_digest,
+                    "backup metadata: {}",
+                    before.path.display()
+                );
+            }
+            commit_operations(&planner, &transaction).unwrap();
+            let restored = rollback_transaction(&transaction, &planner).unwrap();
+            assert!(manifest_mismatches(&transaction.before_manifest, &restored).is_empty());
+        }
     }
 
     #[test]
