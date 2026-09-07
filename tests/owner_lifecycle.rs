@@ -3,7 +3,8 @@
 use std::{
     fs,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -471,6 +472,156 @@ fn force_stop_cancels_an_active_query_without_waiting_for_it() {
         assert_eq!(failure["error"]["code"], "request_cancelled");
         assert_eq!(failure["error"]["data"]["source"], "force_stop");
     });
+}
+
+struct KillChildOnDrop(Child);
+
+impl Drop for KillChildOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_for_child(child: &mut Child, deadline: Instant) {
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "CLI exceeded the 5-second watchdog"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn check_maintenance_under_notifications(disconnect: bool) {
+    let root = TempDir::new().unwrap();
+    let events = root.path().join("events.log");
+    let event_argument = format!("--event-log={}", events.display());
+    let fixture = Fixture::with_configuration(
+        &["--scenario=notification-flood", &event_argument],
+        "[session]\ncancellation_grace = \"250ms\"\n",
+    );
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let marker = fixture.workspace.join("flood-ready");
+    let stdout = root.path().join("stdout.json");
+    let stderr = root.path().join("stderr.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut caller = KillChildOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_lspctl"))
+            .args([
+                "raw",
+                "--workspace",
+                fixture.workspace.to_str().unwrap(),
+                "--server",
+                "fake",
+                "--method",
+                "test/notification-flood",
+                "--params-json",
+                &json!({"marker": marker}).to_string(),
+                "--request-timeout",
+                if disconnect { "30s" } else { "100ms" },
+            ])
+            .envs(fixture.environment.iter().cloned())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    while !marker.exists() && Instant::now() < deadline {
+        assert!(
+            caller.0.try_wait().unwrap().is_none(),
+            "CLI exited before dispatch: {} {}",
+            fs::read_to_string(&stdout).unwrap(),
+            fs::read_to_string(&stderr).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        marker.exists(),
+        "fixture did not dispatch within the watchdog"
+    );
+
+    if disconnect {
+        caller.0.kill().unwrap();
+        wait_for_child(&mut caller.0, deadline);
+    }
+    while !fs::read_to_string(&events)
+        .unwrap()
+        .contains("$/cancelRequest")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "Owner did not cancel under notification traffic within the 5-second watchdog"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let lifetime = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(marker.with_extension("lock"))
+        .unwrap();
+    loop {
+        match lifetime.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "Owner did not terminate the server after cancellation grace within the watchdog"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("could not check fixture lifetime: {error}"),
+        }
+    }
+    let events = fs::read_to_string(&events).unwrap();
+    assert!(
+        events.find("$/cancelRequest").unwrap() < events.find("notification-after-cancel").unwrap(),
+        "notification traffic must continue after ignored cancellation"
+    );
+    wait_for_child(&mut caller.0, deadline);
+    if !disconnect {
+        assert_eq!(caller.0.try_wait().unwrap().unwrap().code(), Some(5));
+        assert!(fs::read(&stderr).unwrap().is_empty());
+        let failure: Value = serde_json::from_slice(&fs::read(&stdout).unwrap()).unwrap();
+        assert_eq!(failure["error"]["code"], "protocol_failed");
+        assert_eq!(failure["error"]["delivery"], "uncertain");
+        assert_eq!(failure["error"]["retry"], "unsafe");
+    }
+
+    // Server exit precedes Owner record cleanup; observe both without an unbounded CLI call.
+    loop {
+        let mut listed = KillChildOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_lspctl"))
+                .args(["session", "list", "--workspace"])
+                .arg(&fixture.workspace)
+                .envs(fixture.environment.iter().cloned())
+                .stdout(fs::File::create(&stdout).unwrap())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        wait_for_child(&mut listed.0, deadline);
+        assert!(listed.0.try_wait().unwrap().unwrap().success());
+        let sessions: Value = serde_json::from_slice(&fs::read(&stdout).unwrap()).unwrap();
+        if sessions["result"] == json!([]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Owner remained after server cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn owner_maintenance_times_out_under_notifications() {
+    check_maintenance_under_notifications(false);
+}
+
+#[test]
+fn owner_maintenance_cancels_disconnected_caller_under_notifications() {
+    check_maintenance_under_notifications(true);
 }
 
 #[test]

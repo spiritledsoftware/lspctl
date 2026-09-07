@@ -21,6 +21,7 @@ enum Scenario {
     Fragmented,
     Delayed,
     DelayedInitialization,
+    NotificationFlood,
     OutOfOrder,
     MalformedHeader,
     MalformedJson,
@@ -40,6 +41,7 @@ impl Scenario {
             "fragmented" => Ok(Self::Fragmented),
             "delayed" => Ok(Self::Delayed),
             "delayed-initialization" => Ok(Self::DelayedInitialization),
+            "notification-flood" => Ok(Self::NotificationFlood),
             "out-of-order" => Ok(Self::OutOfOrder),
             "malformed-header" => Ok(Self::MalformedHeader),
             "malformed-json" => Ok(Self::MalformedJson),
@@ -90,7 +92,7 @@ fn raw(bytes: &[u8]) -> ExitCode {
 }
 
 fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
-    let mut input = BufReader::new(io::stdin().lock());
+    let mut input = BufReader::new(io::stdin());
     let mut output = io::stdout().lock();
     let mut event_log = match event_log.map(File::create).transpose() {
         Ok(log) => log,
@@ -654,6 +656,9 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            Some("test/notification-flood") if scenario == Scenario::NotificationFlood => {
+                return notification_flood(input, &mut output, event_log, &message);
+            }
             Some("test/crash") => {
                 eprintln!("fixture server crashed while handling test/crash");
                 return ExitCode::from(42);
@@ -683,6 +688,69 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 return ExitCode::from(1);
             }
             _ => {}
+        }
+    }
+}
+
+fn notification_flood(
+    mut input: BufReader<io::Stdin>,
+    output: &mut impl Write,
+    mut event_log: Option<File>,
+    request: &Value,
+) -> ExitCode {
+    // Independent of stdin and stdout: even a blocked fixture write cannot leak forever.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(10));
+        std::process::exit(1);
+    });
+    let marker = PathBuf::from(request["params"]["marker"].as_str().unwrap());
+    let lifetime = File::create(marker.with_extension("lock")).unwrap();
+    lifetime.lock().unwrap();
+    std::fs::write(&marker, "ready\n").unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(Some(message)) = read_frame(&mut input) {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "window/logMessage",
+        "params": {"type": 3, "message": "fixture notification traffic"}
+    });
+    let mut next_notification = Instant::now();
+    let mut cancelled = false;
+    loop {
+        match receiver.recv_timeout(next_notification.saturating_duration_since(Instant::now())) {
+            Ok(message) => {
+                if message["method"] == "$/cancelRequest"
+                    && message["params"]["id"] == request["id"]
+                {
+                    cancelled = true;
+                    if let Some(log) = event_log.as_mut() {
+                        writeln!(log, "$/cancelRequest").unwrap();
+                        log.flush().unwrap();
+                    }
+                    // Deliberately ignore cancellation: the Owner must enforce its grace.
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return ExitCode::SUCCESS,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= next_notification {
+            if write_frame(output, &notification, Scenario::Standard).is_err() {
+                return ExitCode::from(1);
+            }
+            if cancelled {
+                if let Some(log) = event_log.as_mut() {
+                    writeln!(log, "notification-after-cancel").unwrap();
+                    log.flush().unwrap();
+                }
+                cancelled = false;
+            }
+            next_notification = Instant::now() + Duration::from_millis(5);
         }
     }
 }
