@@ -90,105 +90,115 @@ pub(crate) fn apply_preview(
         return Ok(application_success(&receipt.receipt, "already_applied"));
     }
     let mut stored = context.store.reserve_preview(preview_id)?;
-    if deadline_expired(context.caller_deadline) {
-        let _ = context.store.release_preview(&mut stored);
-        return Err(application_cancelled(preview_id));
-    }
-    if let Some(reauthorize) = context.reauthorize {
-        let stale_reasons = match reauthorize(&stored) {
-            Ok(reasons) => reasons,
-            Err(failure) => {
-                let _ = context.store.release_preview(&mut stored);
-                return Err(failure);
-            }
-        };
-        if !stale_reasons.is_empty() {
-            let _ = context.store.release_preview(&mut stored);
-            return Err(preview_stale_failure(&stored, stale_reasons));
+    let workspace_path = stored.workspace_path.clone();
+    // All fallible preparation belongs here, before the journal owns the reservation.
+    let prepared = (|| {
+        if deadline_expired(context.caller_deadline) {
+            return Err(application_cancelled(preview_id));
         }
-    }
-    for transaction in context.store.list_transactions()? {
-        match transaction {
-            Ok(transaction) if transaction.workspace_uri == stored.preview.workspace_uri => {
-                let _ = context.store.release_preview(&mut stored);
-                return Err(recovery_required_failure(&transaction));
-            }
-            Ok(_) => {}
-            Err(evidence) => {
-                let _ = context.store.release_preview(&mut stored);
-                return Err(ContractFailure {
-                    exit_code: 7,
-                    category: "recovery",
-                    code: "recovery_evidence_invalid",
-                    message: "Corrupt Recovery evidence blocks Workspace Application.".to_owned(),
-                    stage: "recover",
-                    delivery: "not_applicable",
-                    retry: "never",
-                    data: json!({
-                        "transactionId": transaction_id_from_evidence(&evidence),
-                        "problems": evidence["problems"]
-                    }),
-                });
+        if let Some(reauthorize) = context.reauthorize {
+            let stale_reasons = reauthorize(&stored)?;
+            if !stale_reasons.is_empty() {
+                return Err(preview_stale_failure(&stored, stale_reasons));
             }
         }
-    }
-    context
-        .store
-        .ensure_receipt_capacity(context.receipt_limits)?;
-    let planner = WorkspaceEditPlanner::open(
-        &stored.workspace_path,
-        parse_position_encoding(&stored.preview.position_encoding),
-        context.preview_limits,
-        context.mutation_limits,
-    )
-    .map_err(|problem| unsupported_filesystem_failure(&stored.preview.workspace_uri, &[problem]))?;
-    let current = planner
-        .inspect_manifest(&stored.preview.plan.before_manifest)
-        .map_err(|problems| {
-            unsupported_filesystem_failure(&stored.preview.workspace_uri, &problems)
+        for transaction in context.store.list_transactions()? {
+            match transaction {
+                Ok(transaction) if transaction.workspace_uri == stored.preview.workspace_uri => {
+                    return Err(recovery_required_failure(&transaction));
+                }
+                Ok(_) => {}
+                Err(evidence) => {
+                    return Err(ContractFailure {
+                        exit_code: 7,
+                        category: "recovery",
+                        code: "recovery_evidence_invalid",
+                        message: "Corrupt Recovery evidence blocks Workspace Application."
+                            .to_owned(),
+                        stage: "recover",
+                        delivery: "not_applicable",
+                        retry: "never",
+                        data: json!({
+                            "transactionId": transaction_id_from_evidence(&evidence),
+                            "problems": evidence["problems"]
+                        }),
+                    });
+                }
+            }
+        }
+        context
+            .store
+            .ensure_receipt_capacity(context.receipt_limits)?;
+        let planner = WorkspaceEditPlanner::open(
+            &workspace_path,
+            parse_position_encoding(&stored.preview.position_encoding),
+            context.preview_limits,
+            context.mutation_limits,
+        )
+        .map_err(|problem| {
+            unsupported_filesystem_failure(&stored.preview.workspace_uri, &[problem])
         })?;
-    let stale_reasons = preview_manifest_mismatches(&stored.preview.plan, &current);
-    if !stale_reasons.is_empty() {
-        let _ = context.store.release_preview(&mut stored);
-        return Err(ContractFailure {
-            exit_code: 6,
-            category: "mutation",
-            code: "preview_stale",
-            message: "The Preview no longer matches the Workspace filesystem.".to_owned(),
-            stage: "reserve",
-            delivery: "not_applicable",
-            retry: "after_change",
-            data: json!({
-                "previewId": preview_id,
-                "reasons": stale_reasons,
-                "preconditions": stored.preview.preconditions
-            }),
-        });
-    }
+        let current = planner
+            .inspect_manifest(&stored.preview.plan.before_manifest)
+            .map_err(|problems| {
+                unsupported_filesystem_failure(&stored.preview.workspace_uri, &problems)
+            })?;
+        let stale_reasons = preview_manifest_mismatches(&stored.preview.plan, &current);
+        if !stale_reasons.is_empty() {
+            return Err(ContractFailure {
+                exit_code: 6,
+                category: "mutation",
+                code: "preview_stale",
+                message: "The Preview no longer matches the Workspace filesystem.".to_owned(),
+                stage: "reserve",
+                delivery: "not_applicable",
+                retry: "after_change",
+                data: json!({
+                    "previewId": preview_id,
+                    "reasons": stale_reasons,
+                    "preconditions": stored.preview.preconditions
+                }),
+            });
+        }
 
-    let transaction_id = context.store.new_transaction_id()?;
-    let artifact_directory = stored
-        .workspace_path
-        .join(format!(".lspctl-{transaction_id}"));
-    let mut transaction = TransactionRecord {
-        format_version: MUTATION_STATE_VERSION,
-        transaction_id: transaction_id.clone(),
-        preview_id: preview_id.to_owned(),
-        receipt_id: preview_id.to_owned(),
-        workspace_path: stored.workspace_path.clone(),
-        workspace_uri: stored.preview.workspace_uri.clone(),
-        state: TransactionState::Staged,
-        started_at: now_rfc3339(),
-        artifact_directory: artifact_directory.clone(),
-        backups: planned_backups(&stored.preview.plan.before_manifest, &artifact_directory),
-        operations: stored.preview.plan.operations.clone(),
-        before_manifest: stored.preview.plan.before_manifest.clone(),
-        intended_manifest: stored.preview.plan.intended_manifest.clone(),
-        observed_manifest: current,
-        manifest_digest: manifest_digest(&stored.preview.plan.before_manifest),
-        cleanup_pending: false,
+        let transaction_id = context.store.new_transaction_id()?;
+        let artifact_directory = stored
+            .workspace_path
+            .join(format!(".lspctl-{transaction_id}"));
+        let transaction = TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: transaction_id.clone(),
+            preview_id: preview_id.to_owned(),
+            receipt_id: preview_id.to_owned(),
+            workspace_path: stored.workspace_path.clone(),
+            workspace_uri: stored.preview.workspace_uri.clone(),
+            state: TransactionState::Staged,
+            started_at: now_rfc3339(),
+            artifact_directory: artifact_directory.clone(),
+            backups: planned_backups(&stored.preview.plan.before_manifest, &artifact_directory),
+            operations: stored.preview.plan.operations.clone(),
+            before_manifest: stored.preview.plan.before_manifest.clone(),
+            intended_manifest: stored.preview.plan.intended_manifest.clone(),
+            observed_manifest: current,
+            manifest_digest: manifest_digest(&stored.preview.plan.before_manifest),
+            cleanup_pending: false,
+        };
+        Ok((planner, transaction))
+    })();
+    let (planner, mut transaction) = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            context.store.release_preview(&mut stored)?;
+            return Err(failure);
+        }
     };
-    context.store.write_transaction(&transaction)?;
+    let transaction_id = transaction.transaction_id.clone();
+    finish_initial_journal_write(
+        context.store,
+        &mut stored,
+        &transaction,
+        context.store.write_transaction(&transaction),
+    )?;
     if let Err(stage_failure) = stage_transaction(
         &transaction,
         &stored.preview.plan.operations,
@@ -2748,6 +2758,43 @@ fn preview_stale_failure(stored: &StoredPreview, reasons: Vec<Value>) -> Contrac
     }
 }
 
+fn finish_initial_journal_write(
+    store: &MutationStateStore,
+    stored: &mut StoredPreview,
+    transaction: &TransactionRecord,
+    result: Result<(), ContractFailure>,
+) -> Result<(), ContractFailure> {
+    let Err(failure) = result else {
+        return Ok(());
+    };
+    // Atomic replacement can commit before permission hardening reports an error.
+    // Only a positively absent journal leaves the reservation ours to release.
+    match store.read_transaction(&transaction.transaction_id) {
+        Ok(journal)
+            if journal.transaction_id == transaction.transaction_id
+                && journal.preview_id == transaction.preview_id
+                && journal.receipt_id == transaction.receipt_id
+                && journal.workspace_uri == transaction.workspace_uri
+                && journal.workspace_path == transaction.workspace_path => {}
+        Ok(_) => {
+            return Err(ContractFailure {
+                exit_code: 7,
+                category: "recovery",
+                code: "recovery_evidence_invalid",
+                message: "The initial journal does not match this Application.".to_owned(),
+                stage: "recover",
+                delivery: "not_applicable",
+                retry: "never",
+                data: json!({"transactionId": transaction.transaction_id,
+                    "problems": [{"code": "journal_ownership_mismatch", "message": "Reservation ownership is uncertain."}]}),
+            });
+        }
+        Err(readback) if readback.code == "recovery_not_found" => store.release_preview(stored)?,
+        Err(readback) => return Err(readback),
+    }
+    Err(failure)
+}
+
 fn application_success(receipt: &ReceiptRecord, outcome: &str) -> Value {
     json!({
         "schemaVersion": 1,
@@ -4219,6 +4266,320 @@ mod tests {
             assert!(!artifacts.exists());
             assert!(store.list_transactions().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn preview_reservation_release_failure_is_reported() {
+        for boundary in ["preflight", "absent_journal"] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let file = workspace.path().join("main.txt");
+            fs::write(&file, b"old").unwrap();
+            let root = state.path().join("state");
+            let store = MutationStateStore::open_at(root.clone()).unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+            let edit = json!({"documentChanges": [text_change(&file, 3, "new")]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let id = persist_test_preview(
+                &context,
+                workspace.path(),
+                edit.clone(),
+                planner.plan_workspace_edit(&edit).unwrap(),
+            );
+            let block_release = |stored: &StoredPreview| {
+                assert!(stored.preview.reserved);
+                fs::rename(root.join("previews"), root.join("retained-previews")).unwrap();
+                fs::write(root.join("previews"), b"not a directory").unwrap();
+                Err(application_cancelled(&stored.preview.preview_id))
+            };
+            let failure = if boundary == "preflight" {
+                context.reauthorize = Some(&block_release);
+                apply_preview(&mut context, &id).unwrap_err()
+            } else {
+                let mut transaction = provenance_transaction(workspace.path(), &planner, edit);
+                transaction.preview_id = id.clone();
+                transaction.receipt_id = id.clone();
+                let lock = store
+                    .open_application_lock(&transaction.workspace_uri)
+                    .unwrap();
+                lock.lock().unwrap();
+                let mut stored = store.reserve_preview(&id).unwrap();
+                let original = block_release(&stored).unwrap_err();
+                finish_initial_journal_write(&store, &mut stored, &transaction, Err(original))
+                    .unwrap_err()
+            };
+            assert_eq!(failure.code, "state_unavailable", "{boundary}");
+            assert_eq!(failure.stage, "persist");
+            assert_eq!(failure.data["recordType"], "preview");
+            assert_eq!(fs::read(&file).unwrap(), b"old");
+            fs::remove_file(root.join("previews")).unwrap();
+            fs::rename(root.join("retained-previews"), root.join("previews")).unwrap();
+            assert!(store.read_preview(&id).unwrap().preview.reserved);
+            assert!(store.list_transactions().unwrap().is_empty());
+            assert!(store.list_receipts().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn preview_reservation_retained_after_durable_journal() {
+        for case in [
+            "committed",
+            "committed_error",
+            "absent",
+            "corrupt",
+            "inaccessible",
+            "mismatch",
+        ] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let file = workspace.path().join("main.txt");
+            fs::write(&file, b"old").unwrap();
+            let root = state.path().join("state");
+            let store = MutationStateStore::open_at(root.clone()).unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let context = test_application_context(&store, &previews, &receipts, &mutation);
+            let edit = json!({"documentChanges": [text_change(&file, 3, "new")]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let id = persist_test_preview(
+                &context,
+                workspace.path(),
+                edit.clone(),
+                planner.plan_workspace_edit(&edit).unwrap(),
+            );
+            let mut transaction = provenance_transaction(workspace.path(), &planner, edit);
+            transaction.preview_id = id.clone();
+            transaction.receipt_id = id.clone();
+            transaction.state = TransactionState::Staged;
+            let lock = store
+                .open_application_lock(&transaction.workspace_uri)
+                .unwrap();
+            lock.lock().unwrap();
+            let mut stored = store.reserve_preview(&id).unwrap();
+            let journal = root
+                .join("transactions")
+                .join(format!("{}.json", transaction.transaction_id));
+            if case == "committed" || case == "committed_error" {
+                store.write_transaction(&transaction).unwrap();
+            } else if case == "corrupt" {
+                fs::write(&journal, b"invalid").unwrap();
+            } else if case == "inaccessible" {
+                fs::create_dir(&journal).unwrap();
+            } else if case == "mismatch" {
+                let mut other = transaction.clone();
+                other.preview_id = store.new_preview_id().unwrap();
+                store.write_transaction(&other).unwrap();
+            }
+            // Inject only the write's returned error, after any durable record above.
+            let result = finish_initial_journal_write(
+                &store,
+                &mut stored,
+                &transaction,
+                if case == "committed" {
+                    Ok(())
+                } else {
+                    Err(application_cancelled(&id))
+                },
+            );
+            if case == "committed" {
+                result.unwrap();
+            } else {
+                let failure = result.unwrap_err();
+                let expected = match case {
+                    "corrupt" => "stored_state_version_unsupported",
+                    "inaccessible" => "state_unavailable",
+                    "mismatch" => "recovery_evidence_invalid",
+                    _ => "application_cancelled",
+                };
+                assert_eq!(failure.code, expected, "{case}");
+            }
+            assert_eq!(
+                store.read_preview(&id).unwrap().preview.reserved,
+                case != "absent",
+                "{case}"
+            );
+            assert_eq!(journal.exists(), case != "absent", "{case}");
+            assert_eq!(fs::read(&file).unwrap(), b"old");
+            assert!(!transaction.artifact_directory.exists());
+            assert!(store.list_receipts().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn preview_reservation_released_after_preflight_failure() {
+        for case in [
+            "reauthorization",
+            "authorization_stale",
+            "manifest_stale",
+            "inspection",
+            "planner",
+            "transaction_list",
+            "corrupt_journal",
+        ] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let parent = workspace.path().join("nested");
+            fs::create_dir(&parent).unwrap();
+            let file = parent.join("main.txt");
+            fs::write(&file, b"old").unwrap();
+            let root = state.path().join("state");
+            let store = MutationStateStore::open_at(root.clone()).unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+            let edit = json!({"documentChanges": [text_change(&file, 3, "new")]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let id = persist_test_preview(
+                &context,
+                workspace.path(),
+                edit.clone(),
+                planner.plan_workspace_edit(&edit).unwrap(),
+            );
+            drop(planner);
+            let reauthorize = |stored: &StoredPreview| {
+                assert!(stored.preview.reserved);
+                match case {
+                    "reauthorization" => Err(application_cancelled(&stored.preview.preview_id)),
+                    "authorization_stale" => Ok(vec![json!({"code": "authorization_changed"})]),
+                    _ => Ok(Vec::new()),
+                }
+            };
+            context.reauthorize = Some(&reauthorize);
+            let mut preserved = file.clone();
+            let (code, stage) = match case {
+                "reauthorization" => ("application_cancelled", "lock_workspace"),
+                "authorization_stale" => ("preview_stale", "reserve"),
+                "manifest_stale" => {
+                    fs::write(&file, b"external").unwrap();
+                    ("preview_stale", "reserve")
+                }
+                "inspection" => {
+                    fs::rename(&parent, workspace.path().join("preserved")).unwrap();
+                    fs::write(&parent, b"not a directory").unwrap();
+                    preserved = workspace.path().join("preserved/main.txt");
+                    ("unsupported_filesystem", "validate_mutation")
+                }
+                "planner" => {
+                    let moved = state.path().join("workspace");
+                    fs::rename(workspace.path(), &moved).unwrap();
+                    preserved = moved.join("nested/main.txt");
+                    ("unsupported_filesystem", "validate_mutation")
+                }
+                "transaction_list" => {
+                    fs::remove_dir(root.join("transactions")).unwrap();
+                    fs::write(root.join("transactions"), b"not a directory").unwrap();
+                    ("state_unavailable", "persist")
+                }
+                "corrupt_journal" => {
+                    fs::write(
+                        root.join("transactions/txn_00000000000000000000000000000000.json"),
+                        b"invalid",
+                    )
+                    .unwrap();
+                    ("recovery_evidence_invalid", "recover")
+                }
+                _ => unreachable!(),
+            };
+            let failure = apply_preview(&mut context, &id).unwrap_err();
+            assert_eq!(failure.code, code, "{case}");
+            assert_eq!(failure.stage, stage, "{case}");
+            assert!(!store.read_preview(&id).unwrap().preview.reserved, "{case}");
+            assert_eq!(
+                fs::read(&preserved).unwrap(),
+                if case == "manifest_stale" {
+                    b"external".as_slice()
+                } else {
+                    b"old"
+                },
+                "{case}"
+            );
+            assert!(store.list_receipts().unwrap().is_empty(), "{case}");
+            if case == "transaction_list" {
+                assert_eq!(
+                    fs::read(root.join("transactions")).unwrap(),
+                    b"not a directory"
+                );
+                fs::remove_file(root.join("transactions")).unwrap();
+                fs::create_dir(root.join("transactions")).unwrap();
+            }
+            if case == "corrupt_journal" {
+                assert_eq!(store.list_transactions().unwrap().len(), 1);
+            } else {
+                assert!(store.list_transactions().unwrap().is_empty(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn preview_reservation_released_after_capacity_failure() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let file = workspace.path().join("main.txt");
+        fs::write(&file, b"old").unwrap();
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let (previews, _, mutation) = super::super::default_mutation_settings();
+        let receipts = ReceiptSettings { max_count: 1 };
+        let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+        let create = |context: &ApplicationContext<'_>, text| {
+            let edit = json!({"documentChanges": [text_change(&file, 3, text)]});
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            persist_test_preview(
+                context,
+                workspace.path(),
+                edit.clone(),
+                planner.plan_workspace_edit(&edit).unwrap(),
+            )
+        };
+        let terminal_id = create(&context, "one");
+        assert_eq!(
+            apply_preview(&mut context, &terminal_id).unwrap()["outcome"],
+            "applied"
+        );
+        let id = create(&context, "two");
+
+        let failure = apply_preview(&mut context, &id).unwrap_err();
+        assert_eq!(failure.code, "state_capacity_exceeded");
+        assert!(!store.read_preview(&id).unwrap().preview.reserved);
+        assert_eq!(fs::read(&file).unwrap(), b"one");
+        assert!(store.list_transactions().unwrap().is_empty());
+        assert_eq!(store.list_receipts().unwrap().len(), 1);
+
+        let increased = ReceiptSettings { max_count: 2 };
+        context.receipt_limits = &increased;
+        let first = apply_preview(&mut context, &id).unwrap();
+        let second = apply_preview(&mut context, &id).unwrap();
+        assert_eq!(first["outcome"], "applied");
+        assert_eq!(second["outcome"], "already_applied");
+        assert_eq!(first["result"]["receiptId"], second["result"]["receiptId"]);
+        assert_eq!(
+            first["result"]["transactionId"],
+            second["result"]["transactionId"]
+        );
+        assert_eq!(store.list_receipts().unwrap().len(), 2);
+        assert_eq!(fs::read(&file).unwrap(), b"two");
     }
 
     #[test]

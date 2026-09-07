@@ -6,7 +6,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** S
 - **Risk:** LOW
@@ -168,16 +168,42 @@ Required names: `preview_reservation_released_after_capacity_failure`, `preview_
 
 ## Done criteria
 
-- [ ] All four required tests are listed and pass; the capacity case fails before the implementation change.
-- [ ] A pre-journal capacity/inspection error no longer wedges its Preview ID.
-- [ ] Journal-present and journal-uncertain errors never release transaction-owned reservations.
-- [ ] Failed reservation cleanup is reported, not ignored.
-- [ ] Full tests, Clippy, format, fixture integrity, and diff checks exit 0.
-- [ ] Only scoped files changed and the index status is updated.
+- [x] All four required tests are listed and pass; the capacity case fails before the implementation change.
+- [x] A pre-journal capacity/inspection error no longer wedges its Preview ID.
+- [x] Journal-present and journal-uncertain errors never release transaction-owned reservations.
+- [x] Failed reservation cleanup is reported, not ignored.
+- [x] Full tests, Clippy, format, fixture integrity, and diff checks exit 0.
+- [x] Only scoped files changed and the index status is updated.
 
 ## STOP conditions
 
 STOP if the lock does not cover the handoff, an error cannot distinguish absent from uncertain journal ownership, or implementing the fix requires changing persistent formats or clearing live reservations. Also STOP on unexplained drift, out-of-scope edits, or a verification gate that fails twice after a reasonable correction. Do not use a finally/Drop cleanup that unreserves after a durable transaction exists.
+
+## Verification results
+
+Implemented for #42 from clean checkout `c65ef87c0cd6f5bca3a4112cad51c4b9642ccab5`, already detached HEAD, with explicit commit authorization. Drift from `5268c6a` is explained by merged plans 002 (`230891f`) and 003 (`a35fd80`); their directory-membership and rollback-provenance behavior is retained. `state.rs` had no intervening changes.
+
+| Gate | Result |
+| --- | --- |
+| Baseline `cargo test --locked --bin lspctl mutation::` | 33 passed |
+| Capacity test list, then RED before implementation | Exactly one listed; failed the stored reservation assertion after the expected capacity error |
+| Journal-boundary RED | Definitely absent journal incorrectly retained its reservation |
+| Reservation-write RED | Commit-then-error incorrectly retained its reservation |
+| `cargo test --locked --bin lspctl preview_reservation -- --list` | All four required names plus the reservation-write ownership test |
+| `cargo test --locked --bin lspctl preview_reservation` | 5 passed |
+| `cargo test --locked --bin lspctl mutation::` | 38 passed |
+| Final `cargo test --locked --all-targets --features fake-server` | 118 passed |
+| `cargo clippy --locked --all-targets --features fake-server -- -D warnings` | Exit 0; also run during implementation |
+| `cargo fmt --all -- --check` | Exit 0 |
+| `python scripts/release/check_stored_state.py` | Exit 0 |
+| `git diff --check` | Exit 0 |
+| Independent `/code-review` against the starting commit | Standards: 0 findings; Spec: 0 findings |
+
+One fallible preparation closure now covers the reservation-to-journal boundary under the existing Workspace lock. Cleanup persistence failures replace the preparation error; successful cleanup preserves the original failure. Initial journal-write errors read back the exact generated ID: absent journals release, matching journals retain ownership, and mismatched/corrupt/inaccessible evidence returns a structured failure without releasing or deleting anything. Existing post-journal staging cleanup remains unchanged.
+
+`reserve_preview` itself compensates a failed write only after this invocation read an unreserved record under the lock. That safely handles errors both before and after atomic commit, propagates compensation failures, and never clears an existing reservation. Private persistence seams exercise these orderings without OS-permission assumptions, global failpoints, or sleeps. The capacity test fills a slot through a real successful Application and retries the same second Preview after increasing local capacity, retaining both Receipts.
+
+Only the two allowed source files and this plan/index metadata changed. No persistent format, pruning policy, dependency, or immutable fixture changed. Verification ran on Linux; native macOS/Windows verification remains with CI.
 
 ## Maintenance notes
 
