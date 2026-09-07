@@ -21,6 +21,10 @@ impl Fixture {
     }
 
     fn with_server_arguments(arguments: &[&str]) -> Self {
+        Self::with_configuration(arguments, "")
+    }
+
+    fn with_configuration(arguments: &[&str], configuration: &str) -> Self {
         let root = TempDir::new().unwrap();
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -71,7 +75,7 @@ impl Fixture {
         fs::write(
             config,
             format!(
-                "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\nargs = {}\n",
+                "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\nargs = {}\n{configuration}",
                 env!("CARGO_BIN_EXE_lspctl-fake-server"), arguments
             ),
         )
@@ -589,6 +593,160 @@ fn query_failure_preserves_server_error_partial_results_context_and_trace() {
     );
     assert!(failure["trace"]["frames"].as_array().is_some());
 
+    fixture.stop(workspace);
+}
+
+struct StopOwnerOnPanic<'a>(&'a Fixture);
+
+impl Drop for StopOwnerOnPanic<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let Ok(mut child) = Command::new(env!("CARGO_BIN_EXE_lspctl"))
+            .args([
+                "session",
+                "stop",
+                "--server",
+                "fake",
+                "--force",
+                "--workspace",
+            ])
+            .arg(&self.0.workspace)
+            .envs(self.0.environment.iter().cloned())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn owner_partial_results_chunks_merge_success() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let workspace = fixture.workspace.to_str().unwrap();
+    fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
+    let response = fixture.command(&[
+        "workspace-symbols",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--query",
+        "partial-chunks-success",
+    ]);
+
+    let items = response["result"].as_array().unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "partial-first",
+            "partial-second",
+            "partial-third",
+            "final-symbol"
+        ]
+    );
+    fixture.stop(workspace);
+}
+
+#[test]
+fn owner_partial_results_chunk_failure_remains_flat() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let workspace = fixture.workspace.to_str().unwrap();
+    fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
+    let output = fixture.output(&[
+        "workspace-symbols",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--query",
+        "partial-chunks-error",
+        "--trace-protocol",
+    ]);
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stderr.is_empty());
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "server_error");
+    assert_eq!(failure["error"]["serverError"]["code"], -32603);
+    assert_eq!(failure["method"], "workspace/symbol");
+    assert_eq!(failure["partialResult"]["complete"], false);
+    let items = failure["partialResult"]["items"].as_array().unwrap();
+    assert!(items.iter().all(Value::is_object));
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["partial-first", "partial-second", "partial-third"]
+    );
+    assert_eq!(
+        failure["context"]["workspaceUri"],
+        url::Url::from_directory_path(dunce::canonicalize(&fixture.workspace).unwrap())
+            .unwrap()
+            .to_string()
+    );
+    assert!(failure["trace"]["frames"].as_array().is_some());
+    fixture.stop(workspace);
+}
+
+#[test]
+fn owner_partial_results_limit_keeps_flat_count() {
+    let fixture = Fixture::with_configuration(&[], "[protocol]\nmax_partial_result_bytes = 64\n");
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let workspace = fixture.workspace.to_str().unwrap();
+    fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
+    let output = fixture.output(&[
+        "workspace-symbols",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--query",
+        "partial-chunks-limit",
+        "--trace-protocol",
+    ]);
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stderr.is_empty());
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "partial_result_too_large");
+    assert_eq!(failure["partialResult"]["complete"], false);
+    let items = failure["partialResult"]["items"].as_array().unwrap();
+    assert!(items.iter().all(Value::is_object));
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["partial-first", "partial-second"]
+    );
+    assert_eq!(failure["error"]["data"]["partialItemCount"], 2);
+    assert_eq!(failure["error"]["data"]["limit"], 64);
+    // The retained items are the single wire chunk, including its array delimiters.
+    let chunk_bytes = serde_json::to_vec(items).unwrap().len();
+    assert!(chunk_bytes > 64);
+    assert_eq!(failure["error"]["data"]["collectedBytes"], chunk_bytes);
+    let frames = failure["trace"]["frames"].as_array().unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["message"]["error"]["code"] == -32800)
+    );
     fixture.stop(workspace);
 }
 

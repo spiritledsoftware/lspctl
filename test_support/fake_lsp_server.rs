@@ -97,6 +97,8 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
         Err(_) => return ExitCode::from(1),
     };
     let mut delayed = None;
+    let mut workspace_uri = None;
+    let mut partial_limit_request = None;
     let mut open_documents = BTreeSet::new();
     loop {
         let message = match read_frame(&mut input) {
@@ -123,6 +125,10 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
         match message.get("method").and_then(Value::as_str) {
             Some("exit") => return ExitCode::SUCCESS,
             Some("initialize") => {
+                workspace_uri = message
+                    .pointer("/params/rootUri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| url::Url::parse(uri).ok());
                 if scenario == Scenario::DelayedInitialization {
                     if let Some(gate) = env::args().find_map(|argument| {
                         argument
@@ -214,6 +220,82 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 if write_frame(&mut output, &progress, scenario).is_err()
                     || write_frame(&mut output, &error, scenario).is_err()
                 {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("workspace/symbol")
+                if matches!(
+                    message.pointer("/params/query").and_then(Value::as_str),
+                    Some(
+                        "partial-chunks-success" | "partial-chunks-error" | "partial-chunks-limit"
+                    )
+                ) =>
+            {
+                let query = message["params"]["query"].as_str().unwrap();
+                let uri = workspace_uri.as_ref().unwrap().join("partial.rs").unwrap();
+                let symbol = |name| {
+                    json!({
+                        "name": name,
+                        "kind": 12,
+                        "location": {
+                            "uri": uri.as_str(),
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            }
+                        }
+                    })
+                };
+                let mut chunks = vec![json!([symbol("partial-first"), symbol("partial-second")])];
+                if query != "partial-chunks-limit" {
+                    chunks.push(json!([symbol("partial-third")]));
+                }
+                for chunk in chunks {
+                    let progress = json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/progress",
+                        "params": {"token": message["params"]["partialResultToken"], "value": chunk}
+                    });
+                    if write_frame(&mut output, &progress, scenario).is_err() {
+                        return ExitCode::from(1);
+                    }
+                }
+                match query {
+                    "partial-chunks-limit" => partial_limit_request = Some(message["id"].clone()),
+                    "partial-chunks-error" => {
+                        let error = json!({
+                            "jsonrpc": "2.0",
+                            "id": message["id"],
+                            "error": {"code": -32603, "message": "fixture failure", "data": {"fixture": true}}
+                        });
+                        if write_frame(&mut output, &error, scenario).is_err() {
+                            return ExitCode::from(1);
+                        }
+                    }
+                    _ => {
+                        if result(
+                            &mut output,
+                            &message,
+                            json!([symbol("final-symbol")]),
+                            scenario,
+                        )
+                        .is_err()
+                        {
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+            }
+            Some("$/cancelRequest")
+                if partial_limit_request.is_some()
+                    && message.pointer("/params/id") == partial_limit_request.as_ref() =>
+            {
+                let error = json!({
+                    "jsonrpc": "2.0",
+                    "id": partial_limit_request.take().unwrap(),
+                    "error": {"code": -32800, "message": "fixture request cancelled"}
+                });
+                if write_frame(&mut output, &error, scenario).is_err() {
                     return ExitCode::from(1);
                 }
             }
