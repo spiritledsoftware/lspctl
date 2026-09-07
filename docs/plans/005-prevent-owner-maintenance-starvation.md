@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** S
 - **Risk:** LOW
@@ -126,12 +126,38 @@ The two new tests distinguish timeout cancellation from caller-disconnect cancel
 
 ## Done criteria
 
-- [ ] Exactly the two named `owner_maintenance_` tests are listed and pass.
-- [ ] Each new test has bounded failure cleanup; no fixture Owner/server remains after the test.
-- [ ] FIFO, force-stop, and full lifecycle tests pass.
-- [ ] Full suite, formatting, Clippy, and `git diff --check` exit 0.
-- [ ] No out-of-scope file, protocol value, or dependency changed.
-- [ ] Row 005 in the index is updated with status and verification.
+- [x] Exactly the two named `owner_maintenance_` tests are listed and pass.
+- [x] Each new test has bounded failure cleanup; no fixture Owner/server remains after the test.
+- [x] FIFO, force-stop, and full lifecycle tests pass.
+- [x] Full suite, formatting, Clippy, and `git diff --check` exit 0.
+- [x] No out-of-scope file, protocol value, or dependency changed.
+- [x] Row 005 in the index is updated with status and verification.
+
+## Verification results
+
+Implemented for #41 from `9876f67b9453ad5cacbe4226aefa0f25e733d4ab` in the operator's current checkout (already detached HEAD), with explicit commit authorization. The starting tree was clean. Drift from `5268c6a` in all three shared files was exactly merged plan 004 (#40/#52); its regressions passed in the baseline. The scheduling excerpts and maintenance body had not changed.
+
+| Gate | Result |
+| --- | --- |
+| Baseline `cargo test --locked --all-targets --features fake-server` | 111 passed |
+| `cargo test --locked --features fake-server --test owner_lifecycle owner_maintenance_ -- --list` | Exactly the two required names |
+| Focused RED against the old scheduler | Both failed the explicit cancellation watchdog; command exited in 5.10s, with no malformed-frame or compile failure |
+| Focused GREEN | Both passed in 0.44s |
+| FIFO exact filter | 1 passed |
+| Force-stop exact filter | 1 passed |
+| Complete `owner_lifecycle` integration target | 19 passed |
+| Final `cargo test --locked --all-targets --features fake-server` | 113 passed |
+| `cargo fmt --all -- --check` | Exit 0 |
+| `cargo clippy --locked --all-targets --features fake-server -- -D warnings` | Exit 0, during implementation and at the final gate |
+| `git diff --check` | Exit 0 |
+| Independent `/code-review` against the starting commit | Standards: 0 findings; Spec: 0 findings |
+| Isolated idle-shutdown smoke check | 250ms idle timeout delivered `shutdown` and removed the Owner session within a 5s watchdog |
+
+The production change adds one persistent interval and moves the entire existing maintenance branch first in the biased selection. The first tick is delayed 25ms and missed ticks are skipped. Serial dispatch, the separate absolute idle deadline, cancellation/error semantics, and maintenance work itself remain unchanged.
+
+The fixture uses one stdout writer, a scenario-specific stdin reader, and an independent 10s process-exit watchdog. A lifetime file lock proves server cleanup; an event-log entry proves notification traffic continues after cancellation. Both tests share one 5s outer deadline, kill/reap the CLI on failure, reuse bounded isolated Owner force-stop cleanup, and check the Owner session disappears after server termination. Process inspection after RED found no remaining fixture servers or Owners. Existing lifecycle tests retain initialization queuing, graceful drain, and unexpected-exit coverage. The initial manual idle check incorrectly expected an `exit` event from the standard fixture, which exits when answering `shutdown`; correcting that smoke assertion passed without a source change.
+
+Only the three allowed implementation files and the two metadata files changed. No branch switch, protocol/configuration/schema change, new dependency, or transport-write refactor was needed. Verification ran on Linux; native macOS/Windows verification remains with CI.
 
 ## STOP conditions
 

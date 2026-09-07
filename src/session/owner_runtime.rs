@@ -251,6 +251,11 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         idle_deadline,
     ));
 
+    let maintenance_period = Duration::from_millis(25);
+    let mut maintenance =
+        tokio_time::interval_at(TokioInstant::now() + maintenance_period, maintenance_period);
+    maintenance.set_missed_tick_behavior(tokio_time::MissedTickBehavior::Skip);
+
     while !should_stop {
         status_tx.send_replace(status_result(
             &bootstrap,
@@ -276,6 +281,26 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         tokio::pin!(idle_sleep);
         tokio::select! {
             biased;
+            _ = maintenance.tick() => {
+                if lsp.maintain_active_queries(
+                    &bootstrap.owner_generation,
+                    &mut active_queries,
+                ).await {
+                    should_stop = true;
+                }
+                if let Some(status) = lsp.process.try_wait()? {
+                    lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
+                    lsp.finish_server_stderr().await;
+                    let failure = server_exited_failure(Some(status), &lsp.server_stderr_tail());
+                    fail_active_queries(
+                        &bootstrap.owner_generation,
+                        &mut active_queries,
+                        failure.clone(),
+                    ).await;
+                    fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
+                    should_stop = true;
+                }
+            }
             pending = controls_rx.recv() => {
                 let Some(pending) = pending else { break };
                 if *pending.cancelled.borrow() {
@@ -508,26 +533,6 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 lsp.log.push("lifecycle", "info", "Owner idle timeout reached");
                 lsp.graceful_shutdown().await;
                 should_stop = true;
-            }
-            _ = tokio_time::sleep(Duration::from_millis(25)) => {
-                if lsp.maintain_active_queries(
-                    &bootstrap.owner_generation,
-                    &mut active_queries,
-                ).await {
-                    should_stop = true;
-                }
-                if let Some(status) = lsp.process.try_wait()? {
-                    lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
-                    lsp.finish_server_stderr().await;
-                    let failure = server_exited_failure(Some(status), &lsp.server_stderr_tail());
-                    fail_active_queries(
-                        &bootstrap.owner_generation,
-                        &mut active_queries,
-                        failure.clone(),
-                    ).await;
-                    fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
-                    should_stop = true;
-                }
             }
             changed = connection_closed_rx.changed() => {
                 if changed.is_ok() {
