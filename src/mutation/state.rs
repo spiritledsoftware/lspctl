@@ -276,9 +276,18 @@ impl MutationStateStore {
         write_record(&path, &bytes, "preview")
     }
 
+    /// The caller must hold this Preview's Workspace Application lock.
     pub(crate) fn reserve_preview(
         &self,
         preview_id: &str,
+    ) -> Result<StoredPreview, ContractFailure> {
+        self.reserve_preview_with_writer(preview_id, |preview| self.write_preview(preview))
+    }
+
+    fn reserve_preview_with_writer(
+        &self,
+        preview_id: &str,
+        write: impl FnOnce(&StoredPreview) -> Result<(), ContractFailure>,
     ) -> Result<StoredPreview, ContractFailure> {
         let mut preview = self.read_preview(preview_id)?;
         if preview.preview.reserved {
@@ -294,7 +303,12 @@ impl MutationStateStore {
             });
         }
         preview.preview.reserved = true;
-        self.write_preview(&preview)?;
+        if let Err(failure) = write(&preview) {
+            // This invocation saw an unreserved record under the Application lock;
+            // no journal can own its reservation yet, even if the write committed.
+            self.release_preview(&mut preview)?;
+            return Err(failure);
+        }
         Ok(preview)
     }
 
@@ -1178,6 +1192,79 @@ mod tests {
         drop(lock);
         store.discard_preview(&id).unwrap();
         assert!(store.read_preview(&id).is_err());
+    }
+
+    #[test]
+    fn preview_reservation_write_failure_preserves_existing_ownership() {
+        for case in [
+            "before_commit",
+            "after_commit",
+            "cleanup_failure",
+            "already_reserved",
+        ] {
+            let directory = TempDir::new().unwrap();
+            let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+            let id = store.new_preview_id().unwrap();
+            let (limits, _, _) = super::super::default_mutation_settings();
+            store
+                .create_preview(
+                    preview_record(id.clone()),
+                    directory.path().to_path_buf(),
+                    "sha256:test".to_owned(),
+                    None,
+                    &limits,
+                )
+                .unwrap();
+            let lock = store.open_application_lock("file:///workspace/").unwrap();
+            lock.lock().unwrap();
+            if case == "already_reserved" {
+                store.reserve_preview(&id).unwrap();
+            }
+            let path = store.preview_path(&id);
+            let failure = store
+                .reserve_preview_with_writer(&id, |preview| {
+                    assert_ne!(
+                        case, "already_reserved",
+                        "must reject before attempting a write"
+                    );
+                    if case != "before_commit" {
+                        store.write_preview(preview)?;
+                        assert!(store.read_preview(&id)?.preview.reserved);
+                    }
+                    if case == "cleanup_failure" {
+                        fs::rename(&path, path.with_extension("retained")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    }
+                    Err(state_failure(
+                        "preview",
+                        &path,
+                        "simulated reservation write failure",
+                        None,
+                    ))
+                })
+                .unwrap_err();
+            if case == "cleanup_failure" {
+                assert_ne!(failure.message, "simulated reservation write failure");
+                fs::remove_dir(&path).unwrap();
+                fs::rename(path.with_extension("retained"), &path).unwrap();
+            } else if case != "already_reserved" {
+                assert_eq!(failure.message, "simulated reservation write failure");
+            }
+            assert_eq!(
+                failure.code,
+                if case == "already_reserved" {
+                    "application_busy"
+                } else {
+                    "state_unavailable"
+                }
+            );
+            assert_eq!(
+                store.read_preview(&id).unwrap().preview.reserved,
+                case == "already_reserved" || case == "cleanup_failure",
+                "{case}"
+            );
+            assert!(store.list_transactions().unwrap().is_empty());
+        }
     }
 
     #[test]
