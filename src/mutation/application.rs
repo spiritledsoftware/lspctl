@@ -4471,9 +4471,8 @@ mod tests {
                     ("preview_stale", "reserve")
                 }
                 "inspection" => {
-                    fs::rename(&parent, workspace.path().join("preserved")).unwrap();
-                    fs::write(&parent, b"not a directory").unwrap();
-                    preserved = workspace.path().join("preserved/main.txt");
+                    // Hard links fail inspection on Unix and Windows alike.
+                    fs::hard_link(&file, workspace.path().join("linked.txt")).unwrap();
                     ("unsupported_filesystem", "validate_mutation")
                 }
                 "planner" => {
@@ -4500,6 +4499,9 @@ mod tests {
             let failure = apply_preview(&mut context, &id).unwrap_err();
             assert_eq!(failure.code, code, "{case}");
             assert_eq!(failure.stage, stage, "{case}");
+            if case == "inspection" {
+                assert_eq!(failure.data["missingCapabilities"], json!(["hard_link"]));
+            }
             assert!(!store.read_preview(&id).unwrap().preview.reserved, "{case}");
             assert_eq!(
                 fs::read(&preserved).unwrap(),

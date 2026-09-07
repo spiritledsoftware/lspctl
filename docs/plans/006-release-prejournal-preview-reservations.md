@@ -205,6 +205,10 @@ One fallible preparation closure now covers the reservation-to-journal boundary 
 
 Only the two allowed source files and this plan/index metadata changed. No persistent format, pruning policy, dependency, or immutable fixture changed. Verification ran on Linux; native macOS/Windows verification remains with CI.
 
+### CI portability correction
+
+PR #54's initial Windows 1.89/stable jobs exposed a fixture assumption: a file replacing an ancestor directory is reported as missing on Windows, yielding `preview_stale` rather than an inspection error. The inspection case now creates a hard link and asserts the explicit `hard_link` capability failure, preserving real inspection-error coverage without platform-dependent expectations. No production code changed. The corrected focused test, all 118 Linux tests, Clippy, formatting, and diff checks passed before pushing the correction.
+
 ## Maintenance notes
 
 Keep future fallible preparation calls inside this lifetime boundary. Review the atomic-commit-then-permissions error case specifically; checking only a returned `Result` is insufficient. Historical process-crash orphan reservations remain a separate recovery-policy question, deliberately not solved by a blanket flag reset. Serialize changes with plans 002/003/012 because they share `application.rs`.
