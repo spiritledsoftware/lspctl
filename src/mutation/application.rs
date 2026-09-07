@@ -9,12 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use atomic_write_file::AtomicWriteFile;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions as CapabilityOpenOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    canonical_value::digest_raw_bytes,
+    canonical_value::{digest_canonical_value, digest_raw_bytes},
     configuration::{MutationSettings, PreviewSettings, ReceiptSettings},
     contract::ContractFailure,
     state_permissions,
@@ -24,7 +26,7 @@ use crate::{
 use super::{
     planner::{
         CanonicalOperation, CanonicalPlan, ManifestEntry, ResourceKind, WorkspaceEditPlanner,
-        WorkspaceEditProblem,
+        WorkspaceEditProblem, missing_manifest, open_file_identity,
     },
     state::{
         BackupEntry, MUTATION_STATE_VERSION, MutationStateStore, ReceiptRecord, StoredPreview,
@@ -229,11 +231,7 @@ pub(crate) fn apply_preview(
     transaction.state = TransactionState::Committing;
     context.store.write_transaction(&transaction)?;
     let started_at = transaction.started_at.clone();
-    let commit_result = commit_operations(
-        &planner,
-        &transaction.artifact_directory,
-        &stored.preview.plan.operations,
-    );
+    let commit_result = commit_operations(&planner, &transaction);
     let observed = planner
         .inspect_manifest(&stored.preview.plan.intended_manifest)
         .unwrap_or_default();
@@ -735,6 +733,598 @@ fn recover_transaction(
     }))
 }
 
+const PROGRESS_FILE: &str = "commit-progress.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitProgress {
+    version: u32,
+    transaction_id: String,
+    operations_digest: String,
+    before_digest: String,
+    effects: Vec<CommitEffect>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitEffect {
+    index: u64,
+    before: Vec<ManifestEntry>,
+    // None is durable pending intent, never evidence that no effect occurred.
+    after: Option<Vec<ManifestEntry>>,
+}
+
+impl CommitProgress {
+    fn new(transaction: &TransactionRecord) -> Self {
+        Self {
+            version: 1,
+            transaction_id: transaction.transaction_id.clone(),
+            operations_digest: digest_canonical_value(
+                "lspctl-commit-operations-v1",
+                &json!(transaction.operations),
+            ),
+            before_digest: manifest_digest(&transaction.before_manifest),
+            effects: Vec::new(),
+        }
+    }
+}
+
+fn operation_index(operation: &CanonicalOperation) -> u64 {
+    match operation {
+        CanonicalOperation::Text { index, .. }
+        | CanonicalOperation::Create { index, .. }
+        | CanonicalOperation::Rename { index, .. }
+        | CanonicalOperation::Delete { index, .. } => *index,
+    }
+}
+
+fn initial_progress_manifest(transaction: &TransactionRecord) -> Vec<ManifestEntry> {
+    let mut entries = transaction
+        .intended_manifest
+        .iter()
+        .map(|entry| (entry.path.clone(), missing_manifest(&entry.path)))
+        .collect::<BTreeMap<_, _>>();
+    entries.extend(
+        transaction
+            .before_manifest
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.clone())),
+    );
+    let mut entries = entries.into_values().collect::<Vec<_>>();
+    // Private commit evidence may certify the already enumerated legacy tree without changing v1 vocabulary.
+    for entry in &mut entries {
+        if entry.resource_kind == ResourceKind::Directory
+            && transaction
+                .operations
+                .iter()
+                .any(|operation| match operation {
+                    CanonicalOperation::Rename {
+                        old_path,
+                        new_path,
+                        overwrite,
+                        ..
+                    } => {
+                        entry.path.starts_with(old_path)
+                            || (*overwrite && entry.path.starts_with(new_path))
+                    }
+                    CanonicalOperation::Delete { path, .. } => entry.path.starts_with(path),
+                    _ => false,
+                })
+        {
+            entry.content_digest = Some(String::new());
+        }
+    }
+    refresh_membership(&mut entries);
+    entries
+}
+
+fn translated_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    let suffix = path.strip_prefix(from).unwrap();
+    if suffix.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(suffix)
+    }
+}
+
+fn refresh_membership(entries: &mut [ManifestEntry]) {
+    for index in 0..entries.len() {
+        if entries[index].resource_kind != ResourceKind::Directory
+            || entries[index].content_digest.is_none()
+        {
+            continue;
+        }
+        let children = entries
+            .iter()
+            .filter(|entry| {
+                entry.exists && entry.path.parent() == Some(entries[index].path.as_path())
+            })
+            .map(|entry| {
+                (
+                    entry.path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    entry.resource_kind,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        entries[index].content_digest = Some(digest_canonical_value(
+            "lspctl-directory-membership-v1",
+            &json!(children),
+        ));
+    }
+}
+
+fn add_undo_manifest(
+    entries: &mut Vec<ManifestEntry>,
+    transaction: &TransactionRecord,
+    operation: &CanonicalOperation,
+) {
+    let path = match operation {
+        CanonicalOperation::Rename { new_path, .. } => new_path,
+        CanonicalOperation::Delete { path, .. } => path,
+        _ => return,
+    };
+    let undo = undo_resource_path(&transaction.artifact_directory, operation_index(operation));
+    let missing = entries
+        .iter()
+        .filter(|entry| entry.path.starts_with(path))
+        .map(|entry| missing_manifest(&translated_path(&entry.path, path, &undo)))
+        .collect::<Vec<_>>();
+    entries.extend(missing);
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+}
+
+fn require_manifest(
+    planner: &WorkspaceEditPlanner<'_>,
+    expected: &[ManifestEntry],
+) -> Result<(), String> {
+    let actual = planner
+        .inspect_manifest(expected)
+        .map_err(|_| "Progress resources cannot be safely inspected.".to_owned())?;
+    if actual != expected {
+        return Err("Resources differ from the proven Application state.".to_owned());
+    }
+    Ok(())
+}
+
+fn open_owned_artifacts(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+) -> Result<Dir, String> {
+    if transaction.artifact_directory
+        != transaction
+            .workspace_path
+            .join(format!(".lspctl-{}", transaction.transaction_id))
+    {
+        return Err("Invalid transaction artifact location.".to_owned());
+    }
+    let dir = planner
+        .capability_root()
+        .open_dir_nofollow(planner.relative_path(&transaction.artifact_directory)?)
+        .map_err(|e| e.to_string())?;
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut owner = dir
+        .open_with(ARTIFACT_OWNER_FILE, &options)
+        .map_err(|e| e.to_string())?;
+    if !owner.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Invalid artifact owner marker.".to_owned());
+    }
+    let mut marker = String::new();
+    Read::by_ref(&mut owner)
+        .take(transaction.transaction_id.len() as u64 + 1)
+        .read_to_string(&mut marker)
+        .map_err(|e| e.to_string())?;
+    if marker != transaction.transaction_id {
+        return Err("Transaction artifact ownership is unavailable.".to_owned());
+    }
+    Ok(dir)
+}
+
+fn progress_size_limit(transaction: &TransactionRecord) -> Result<u64, String> {
+    // ponytail: full snapshots cost O(entries * operations²) with undo trees; use deltas if large plans need it.
+    // Each operation can add one translated undo tree, bounded by the already limited plan.
+    let bytes = serde_json::to_vec(transaction)
+        .map_err(|e| e.to_string())?
+        .len() as u64;
+    let count = transaction.operations.len() as u64 + 1;
+    bytes
+        .checked_mul(count)
+        .and_then(|n| n.checked_mul(count))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "Commit evidence size bound overflowed.".to_owned())
+}
+
+fn write_progress(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+    progress: &CommitProgress,
+) -> Result<(), String> {
+    let _dir = open_owned_artifacts(transaction, planner)?;
+    let bytes = serde_json::to_vec(progress).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > progress_size_limit(transaction)? {
+        return Err("Commit evidence exceeds its size bound.".to_owned());
+    }
+    let path = transaction.artifact_directory.join(PROGRESS_FILE);
+    let mut output = AtomicWriteFile::open(&path).map_err(|e| e.to_string())?;
+    output.write_all(&bytes).map_err(|e| e.to_string())?;
+    output.commit().map_err(|e| e.to_string())?;
+    state_permissions::restrict_file(&path).map_err(|e| e.to_string())?;
+    flush_directory(&transaction.artifact_directory).map_err(|e| e.to_string())
+}
+
+fn read_progress(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+) -> Result<CommitProgress, String> {
+    let dir = open_owned_artifacts(transaction, planner)?;
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = dir
+        .open_with(PROGRESS_FILE, &options)
+        .map_err(|e| e.to_string())?;
+    let limit = progress_size_limit(transaction)?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err("Invalid commit evidence size or kind.".to_owned());
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("Commit evidence exceeds its size bound.".to_owned());
+    }
+    let progress: CommitProgress = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let binding = CommitProgress::new(transaction);
+    if progress.version != binding.version
+        || progress.transaction_id != binding.transaction_id
+        || progress.operations_digest != binding.operations_digest
+        || progress.before_digest != binding.before_digest
+        || progress.effects.len() > transaction.operations.len()
+    {
+        return Err("Commit evidence does not bind this transaction.".to_owned());
+    }
+    let mut expected = initial_progress_manifest(transaction);
+    for (position, effect) in progress.effects.iter().enumerate() {
+        let operation = &transaction.operations[position];
+        add_undo_manifest(&mut expected, transaction, operation);
+        if effect.index != operation_index(operation) || effect.before != expected {
+            return Err("Commit evidence has invalid operation order or preconditions.".to_owned());
+        }
+        if let Some(after) = &effect.after {
+            let identity = match operation {
+                CanonicalOperation::Text { path, .. } | CanonicalOperation::Create { path, .. } => {
+                    manifest_for_path(after, path)?.identity_digest.as_deref()
+                }
+                _ => None,
+            };
+            expected = operation_after(transaction, operation, &expected, after, identity)?;
+            if &expected != after {
+                return Err("Commit evidence has an impossible result.".to_owned());
+            }
+        } else if position + 1 != progress.effects.len() {
+            return Err("Commit evidence advances past an uncertain operation.".to_owned());
+        }
+    }
+    Ok(progress)
+}
+
+struct MoveHandle {
+    file: File,
+    identity: String,
+    #[cfg(windows)]
+    security_descriptor: Vec<u8>,
+    #[cfg(windows)]
+    created: std::time::SystemTime,
+}
+
+fn retain_effect_handles(
+    planner: &WorkspaceEditPlanner<'_>,
+    operation: &CanonicalOperation,
+    before: &[ManifestEntry],
+) -> Result<Vec<MoveHandle>, String> {
+    let paths = match operation {
+        CanonicalOperation::Rename {
+            old_path, new_path, ..
+        } => vec![old_path, new_path],
+        CanonicalOperation::Delete { path, .. } => vec![path],
+        _ => vec![],
+    };
+    paths
+        .into_iter()
+        .filter(|path| manifest_for_path(before, path).is_ok_and(|entry| entry.exists))
+        .map(|path| retain_move_handle(planner, manifest_for_path(before, path)?))
+        .collect()
+}
+
+fn retain_move_handle(
+    planner: &WorkspaceEditPlanner<'_>,
+    expected: &ManifestEntry,
+) -> Result<MoveHandle, String> {
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, WRITE_DAC},
+        };
+        // Keep share-delete enabled while retaining the right to restore the moved root's DACL.
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .access_mode(GENERIC_READ | WRITE_DAC | FILE_WRITE_ATTRIBUTES);
+    }
+    let file = planner
+        .capability_root()
+        .open_with(planner.relative_path(&expected.path)?, &options)
+        .map_err(|e| e.to_string())?
+        .into_std();
+    let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
+    if expected.identity_digest.as_deref() != Some(&identity) {
+        return Err("Resource handle differs from commit preconditions.".to_owned());
+    }
+    Ok(MoveHandle {
+        identity,
+        #[cfg(windows)]
+        security_descriptor: move_security_descriptor(&file).map_err(|e| e.to_string())?,
+        #[cfg(windows)]
+        created: file
+            .metadata()
+            .and_then(|metadata| metadata.created())
+            .map_err(|e| e.to_string())?,
+        file,
+    })
+}
+
+#[cfg(windows)]
+fn move_security_descriptor(file: &File) -> std::io::Result<Vec<u8>> {
+    use std::{os::windows::io::AsRawHandle, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorLength,
+            OWNER_SECURITY_INFORMATION,
+        },
+    };
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    let bytes = if length == 0 {
+        Err(std::io::Error::other(
+            "The move security descriptor is empty.",
+        ))
+    } else {
+        Ok(unsafe { slice::from_raw_parts(descriptor.cast::<u8>(), length) }.to_vec())
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    bytes
+}
+
+#[cfg(windows)]
+fn without_inherited_ace_flags(mut descriptor: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, GetAce, GetSecurityDescriptorDacl, INHERITED_ACE,
+    };
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = ptr::null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_mut_ptr().cast(),
+            &mut present,
+            &mut dacl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if present != 0 && !dacl.is_null() {
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Descriptors come directly from GetSecurityInfo, and GetAce locates each header.
+            unsafe {
+                (*ace.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8);
+            }
+        }
+    }
+    Ok(descriptor)
+}
+
+#[cfg(windows)]
+fn preserve_move_metadata(handle: &MoveHandle) -> std::io::Result<()> {
+    use std::os::windows::{fs::FileTimesExt, io::AsRawHandle};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
+    let current = move_security_descriptor(&handle.file)?;
+    let changed = current != handle.security_descriptor;
+    if changed
+        && without_inherited_ace_flags(current)?
+            != without_inherited_ace_flags(handle.security_descriptor.clone())?
+    {
+        return Err(std::io::Error::other(
+            "The moved security descriptor changed externally.",
+        ));
+    }
+    // Narrow legacy API exception: SetSecurityInfo recomputes inheritance on filesystem objects.
+    // Only the proven INHERITED_ACE-bit rewrite may be undone, through this retained handle,
+    // without propagating the root's ACL to children or changing any other descriptor bytes.
+    if changed
+        && unsafe {
+            SetKernelObjectSecurity(
+                handle.file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                handle.security_descriptor.as_ptr().cast_mut().cast(),
+            )
+        } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if move_security_descriptor(&handle.file)? != handle.security_descriptor {
+        return Err(std::io::Error::other(
+            "The moved security descriptor could not be preserved.",
+        ));
+    }
+    // NTFS tunneling can copy the vacated destination's creation time onto a renamed file.
+    // Restore the time captured from the moved handle only after rejecting unrelated ACL changes.
+    handle
+        .file
+        .set_times(fs::FileTimes::new().set_created(handle.created))
+}
+
+fn operation_after(
+    transaction: &TransactionRecord,
+    operation: &CanonicalOperation,
+    before: &[ManifestEntry],
+    observed: &[ManifestEntry],
+    handle_identity: Option<&str>,
+) -> Result<Vec<ManifestEntry>, String> {
+    let mut after = before
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    match operation {
+        CanonicalOperation::Text {
+            path,
+            before_digest,
+            after_digest,
+            ..
+        } => {
+            let entry = after.get_mut(path).ok_or("Missing text precondition.")?;
+            if entry.content_digest.as_ref() != Some(before_digest)
+                || entry.identity_digest.as_deref() != handle_identity
+            {
+                return Err(
+                    "Text handle or before content does not match the canonical operation."
+                        .to_owned(),
+                );
+            }
+            entry.content_digest = Some(after_digest.clone());
+        }
+        CanonicalOperation::Create {
+            path,
+            overwrite,
+            ignore_if_exists,
+            ..
+        } => {
+            let entry = after.get_mut(path).ok_or("Missing create precondition.")?;
+            if entry.exists && !overwrite {
+                if !ignore_if_exists {
+                    return Err("Unexpected occupied create target.".to_owned());
+                }
+            } else if entry.exists {
+                if entry.identity_digest.as_deref() != handle_identity {
+                    return Err("Overwrite handle changed.".to_owned());
+                }
+                entry.content_digest = Some(digest_raw_bytes(b""));
+            } else {
+                let created = manifest_for_path(observed, path)?;
+                if created.resource_kind != ResourceKind::File
+                    || created.identity_digest.is_none()
+                    || created.identity_digest.as_deref() != handle_identity
+                    || created.content_digest != Some(digest_raw_bytes(b""))
+                {
+                    return Err(
+                        "Created resource does not match its handle and canonical empty content."
+                            .to_owned(),
+                    );
+                }
+                *entry = created.clone();
+            }
+        }
+        CanonicalOperation::Rename {
+            index,
+            old_path,
+            new_path,
+            overwrite,
+            ignore_if_exists,
+            ..
+        } => {
+            if after.get(new_path).is_some_and(|entry| entry.exists) {
+                if *overwrite {
+                    transfer_manifest(
+                        &mut after,
+                        new_path,
+                        &undo_resource_path(&transaction.artifact_directory, *index),
+                    )?;
+                } else if *ignore_if_exists {
+                    return Ok(before.to_vec());
+                } else {
+                    return Err("Unexpected occupied rename destination.".to_owned());
+                }
+            }
+            transfer_manifest(&mut after, old_path, new_path)?;
+        }
+        CanonicalOperation::Delete {
+            index,
+            path,
+            ignore_if_not_exists,
+            ..
+        } => {
+            if after.get(path).is_some_and(|entry| entry.exists) {
+                transfer_manifest(
+                    &mut after,
+                    path,
+                    &undo_resource_path(&transaction.artifact_directory, *index),
+                )?;
+            } else if !ignore_if_not_exists {
+                return Err("Unexpected missing delete target.".to_owned());
+            }
+        }
+    }
+    let mut after = after.into_values().collect::<Vec<_>>();
+    refresh_membership(&mut after);
+    Ok(after)
+}
+
+fn transfer_manifest(
+    entries: &mut BTreeMap<PathBuf, ManifestEntry>,
+    from: &Path,
+    to: &Path,
+) -> Result<(), String> {
+    let tree = entries
+        .values()
+        .filter(|entry| entry.exists && entry.path.starts_with(from))
+        .cloned()
+        .collect::<Vec<_>>();
+    if tree.is_empty() {
+        return Err("Missing transferred resource.".to_owned());
+    }
+    for entry in tree {
+        if entry.resource_kind == ResourceKind::Directory && entry.content_digest.is_none() {
+            return Err("Directory transfer lacks a membership certificate.".to_owned());
+        }
+        entries.insert(entry.path.clone(), missing_manifest(&entry.path));
+        let path = translated_path(&entry.path, from, to);
+        let mut moved = entry;
+        moved.path = path.clone();
+        entries.insert(path, moved);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct CommitFailure {
     operation_index: u64,
@@ -743,81 +1333,125 @@ struct CommitFailure {
 
 fn commit_operations(
     planner: &WorkspaceEditPlanner<'_>,
-    artifact_directory: &Path,
-    operations: &[CanonicalOperation],
+    transaction: &TransactionRecord,
 ) -> Result<(), CommitFailure> {
-    for operation in operations {
-        let result = match operation {
-            CanonicalOperation::Text {
+    commit_operations_with_writer(planner, transaction, |progress| {
+        write_progress(transaction, planner, progress)
+    })
+}
+
+fn commit_operations_with_writer(
+    planner: &WorkspaceEditPlanner<'_>,
+    transaction: &TransactionRecord,
+    mut persist: impl FnMut(&CommitProgress) -> Result<(), String>,
+) -> Result<(), CommitFailure> {
+    let artifact_directory = &transaction.artifact_directory;
+    let mut progress = CommitProgress::new(transaction);
+    let mut expected = initial_progress_manifest(transaction);
+    for operation in &transaction.operations {
+        let index = operation_index(operation);
+        let result = (|| -> Result<(), String> {
+            add_undo_manifest(&mut expected, transaction, operation);
+            require_manifest(planner, &expected)?;
+            progress.effects.push(CommitEffect {
                 index,
-                path,
-                before_digest,
-                after_digest,
-                ..
-            } => apply_text_operation(
-                planner,
-                artifact_directory,
-                *index,
-                path,
-                before_digest,
-                after_digest,
-            )
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-            CanonicalOperation::Create {
-                index,
-                path,
-                overwrite,
-                ignore_if_exists,
-                ..
-            } => apply_create_operation(planner, path, *overwrite, *ignore_if_exists).map_err(
-                |reason| CommitFailure {
-                    operation_index: *index,
-                    _reason: reason,
-                },
-            ),
-            CanonicalOperation::Rename {
-                index,
-                old_path,
-                new_path,
-                overwrite,
-                ignore_if_exists,
-                ..
-            } => apply_rename_operation(
-                planner,
-                artifact_directory,
-                *index,
-                old_path,
-                new_path,
-                *overwrite,
-                *ignore_if_exists,
-            )
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-            CanonicalOperation::Delete {
-                index,
-                path,
-                recursive,
-                ignore_if_not_exists,
-                ..
-            } => apply_delete_operation(
-                planner,
-                artifact_directory,
-                *index,
-                path,
-                *recursive,
-                *ignore_if_not_exists,
-            )
-            .map_err(|reason| CommitFailure {
-                operation_index: *index,
-                _reason: reason,
-            }),
-        };
-        result?;
+                before: expected.clone(),
+                after: None,
+            });
+            persist(&progress)?;
+            let retained = retain_effect_handles(planner, operation, &expected)?;
+            let identity = match operation {
+                CanonicalOperation::Text {
+                    index,
+                    path,
+                    before_digest,
+                    after_digest,
+                    ..
+                } => apply_text_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    path,
+                    before_digest,
+                    after_digest,
+                    manifest_for_path(&expected, path)
+                        .unwrap()
+                        .identity_digest
+                        .as_deref(),
+                ),
+                CanonicalOperation::Create {
+                    path,
+                    overwrite,
+                    ignore_if_exists,
+                    ..
+                } => apply_create_operation(
+                    planner,
+                    path,
+                    *overwrite,
+                    *ignore_if_exists,
+                    manifest_for_path(&expected, path)
+                        .unwrap()
+                        .identity_digest
+                        .as_deref(),
+                ),
+                CanonicalOperation::Rename {
+                    index,
+                    old_path,
+                    new_path,
+                    overwrite,
+                    ignore_if_exists,
+                    ..
+                } => apply_rename_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    old_path,
+                    new_path,
+                    *overwrite,
+                    *ignore_if_exists,
+                )
+                .map(|()| None),
+                CanonicalOperation::Delete {
+                    index,
+                    path,
+                    recursive,
+                    ignore_if_not_exists,
+                    ..
+                } => apply_delete_operation(
+                    planner,
+                    artifact_directory,
+                    *index,
+                    path,
+                    *recursive,
+                    *ignore_if_not_exists,
+                )
+                .map(|()| None),
+            }?;
+            for handle in &retained {
+                if open_file_identity(&handle.file).map_err(|e| e.to_string())? != handle.identity {
+                    return Err("A moved resource handle changed.".to_owned());
+                }
+                #[cfg(windows)]
+                preserve_move_metadata(handle).map_err(|e| e.to_string())?;
+            }
+            let observed = planner
+                .inspect_manifest(&expected)
+                .map_err(|problems| format!("Commit evidence cannot be inspected: {problems:?}"))?;
+            expected = operation_after(
+                transaction,
+                operation,
+                &expected,
+                &observed,
+                identity.as_deref(),
+            )?;
+            require_manifest(planner, &expected)?;
+            progress.effects.last_mut().unwrap().after = Some(expected.clone());
+            persist(&progress)
+        })();
+        result.map_err(|reason| CommitFailure {
+            operation_index: index,
+            _reason: reason,
+        })?;
     }
     Ok(())
 }
@@ -829,22 +1463,25 @@ fn apply_text_operation(
     path: &Path,
     before_digest: &str,
     after_digest: &str,
-) -> Result<(), String> {
+    expected_identity: Option<&str>,
+) -> Result<Option<String>, String> {
     let relative = planner.relative_path(path)?;
     let mut read_options = CapabilityOpenOptions::new();
-    read_options.read(true).follow(FollowSymlinks::No);
-    let mut source = planner
+    read_options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No);
+    let mut file = planner
         .capability_root()
         .open_with(relative, &read_options)
-        .map_err(|error| error.to_string())?;
-    let accessed = source
+        .map_err(|error| error.to_string())?
+        .into_std();
+    let accessed = file
         .metadata()
         .and_then(|metadata| metadata.accessed())
-        .map_err(|error| format!("The text resource access time cannot be inspected: {error}"))?
-        .into_std();
+        .map_err(|error| format!("The text resource access time cannot be inspected: {error}"))?;
     let mut bytes = Vec::new();
-    source
-        .read_to_end(&mut bytes)
+    file.read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     if digest_raw_bytes(&bytes) != before_digest {
         return Err("Text resource changed during commit.".to_owned());
@@ -854,22 +1491,24 @@ fn apply_text_operation(
     if digest_raw_bytes(&result) != after_digest {
         return Err("Canonical text edit digest does not match.".to_owned());
     }
-    drop(source);
-    let mut write_options = CapabilityOpenOptions::new();
-    write_options.write(true).follow(FollowSymlinks::No);
-    let mut file = planner
-        .capability_root()
-        .open_with(relative, &write_options)
-        .map_err(|error| error.to_string())?;
+    let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
+    if expected_identity != Some(identity.as_str())
+        || inspect_manifest_path(planner, path)?
+            .identity_digest
+            .as_deref()
+            != Some(&identity)
+    {
+        return Err("Text resource was replaced before truncation.".to_owned());
+    }
     file.set_len(0).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&result))
         .and_then(|_| file.sync_all())
         .map_err(|error| error.to_string())?;
-    let file = file.into_std();
     file.set_times(std::fs::FileTimes::new().set_accessed(accessed))
         .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(Some(identity))
 }
 
 fn apply_create_operation(
@@ -877,23 +1516,34 @@ fn apply_create_operation(
     path: &Path,
     overwrite: bool,
     ignore_if_exists: bool,
-) -> Result<(), String> {
+    expected_identity: Option<&str>,
+) -> Result<Option<String>, String> {
     let root = planner.capability_root();
     let relative = planner.relative_path(path)?;
     if root.symlink_metadata(relative).is_ok() {
         if overwrite {
             let mut options = CapabilityOpenOptions::new();
-            options
-                .write(true)
-                .truncate(true)
-                .follow(FollowSymlinks::No);
+            options.write(true).follow(FollowSymlinks::No);
             let file = root
                 .open_with(relative, &options)
-                .map_err(|error| error.to_string())?;
-            return file.sync_all().map_err(|error| error.to_string());
+                .map_err(|error| error.to_string())?
+                .into_std();
+            let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
+            if expected_identity != Some(identity.as_str())
+                || inspect_manifest_path(planner, path)?
+                    .identity_digest
+                    .as_deref()
+                    != Some(&identity)
+            {
+                return Err("CreateFile target was replaced before truncation.".to_owned());
+            }
+            file.set_len(0)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(identity));
         }
         if ignore_if_exists {
-            return Ok(());
+            return Ok(None);
         }
         return Err("CreateFile target exists.".to_owned());
     }
@@ -905,8 +1555,11 @@ fn apply_create_operation(
     let file = root
         .open_with(relative, &options)
         .map_err(|error| error.to_string())?;
+    let file = file.into_std();
+    let identity = open_file_identity(&file).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    flush_parent(path).map_err(|error| error.to_string())
+    flush_parent(path).map_err(|error| error.to_string())?;
+    Ok(Some(identity))
 }
 
 fn apply_rename_operation(
@@ -1364,86 +2017,71 @@ fn rollback_transaction(
     transaction: &TransactionRecord,
     planner: &WorkspaceEditPlanner<'_>,
 ) -> Result<Vec<ManifestEntry>, String> {
-    rollback_resource_operations(transaction, planner)?;
     let current = inspect_transaction_manifest(planner, transaction).map_err(|problems| {
         format!("The partial filesystem is unsafe for automatic rollback: {problems:?}")
     })?;
-    let mut restore_in_place = Vec::new();
-    for expected in transaction
-        .before_manifest
-        .iter()
-        .filter(|entry| entry.exists)
-    {
-        let actual = current
-            .iter()
-            .find(|entry| entry.path == expected.path)
-            .ok_or_else(|| "A pre-Application resource is missing during rollback.".to_owned())?;
-        if expected == actual {
-            continue;
+    if manifest_mismatches(&transaction.before_manifest, &current).is_empty() {
+        return Ok(current);
+    }
+    let progress = read_progress(transaction, planner)?;
+    if progress.effects.iter().any(|effect| effect.after.is_none()) {
+        return Err("An uncertain commit effect requires Recovery.".to_owned());
+    }
+    let Some(last) = progress.effects.last() else {
+        return Err("No completed Application effects are proven.".to_owned());
+    };
+    require_manifest(planner, last.after.as_ref().unwrap())?;
+    // Preflight every reverse step, including its protected restore content, before changing bytes.
+    let mut reversed = last.after.as_ref().unwrap().clone();
+    for (operation, effect) in transaction.operations.iter().zip(&progress.effects).rev() {
+        if reversed != *effect.after.as_ref().unwrap() {
+            return Err("Commit effects do not form an undo chain.".to_owned());
         }
-        if expected.resource_kind == ResourceKind::File
-            && actual.resource_kind == ResourceKind::File
-            && expected.identity_digest == actual.identity_digest
+        if let CanonicalOperation::Text { path, .. } | CanonicalOperation::Create { path, .. } =
+            operation
         {
-            let backup_path = backup_path_for(&transaction.backups, &expected.path)
-                .ok_or_else(|| "A required rollback backup is missing.".to_owned())?;
-            restore_in_place.push((backup_path, expected.path.clone()));
-        } else {
-            return Err(
-                "Automatic rollback cannot restore the original resource identity.".to_owned(),
-            );
+            let before = manifest_for_path(&effect.before, path)?;
+            if before.exists {
+                rollback_text_bytes(transaction, planner, before)?;
+            }
+        }
+        reversed = effect.before.clone();
+        // Later operations can introduce only missing, derived undo paths into the chain.
+        if let Some(previous) = progress
+            .effects
+            .iter()
+            .take_while(|candidate| candidate.index != effect.index)
+            .last()
+        {
+            reversed.retain(|entry| {
+                previous
+                    .after
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|old| old.path == entry.path)
+            });
         }
     }
-
-    let mut created = transaction
-        .before_manifest
-        .iter()
-        .filter(|entry| !entry.exists)
-        .filter_map(|entry| {
-            current
-                .iter()
-                .find(|actual| actual.path == entry.path && actual.exists)
-                .map(|_| entry.path.clone())
-        })
-        .collect::<Vec<_>>();
-    created.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in created {
-        if path.exists() {
-            let relative = planner.relative_path(&path)?;
-            remove_capability_resource(planner.capability_root(), relative)
-                .map_err(|error| error.to_string())?;
-            flush_parent(&path).map_err(|error| error.to_string())?;
-        }
+    if !manifest_mismatches(&transaction.before_manifest, &reversed).is_empty() {
+        return Err("Proven effects cannot restore the full before-manifest.".to_owned());
     }
-    for (backup_path, destination) in restore_in_place {
-        restore_file_backup(planner, &backup_path, &destination)
-            .map_err(|error| error.to_string())?;
-    }
-    let restored = inspect_transaction_manifest(planner, transaction)
-        .map_err(|_| "The restored filesystem cannot be inspected.".to_owned())?;
-    let mismatches = manifest_mismatches(&transaction.before_manifest, &restored);
-    if mismatches.is_empty() {
-        Ok(restored)
-    } else {
-        Err("The rollback manifest does not match its preconditions.".to_owned())
-    }
-}
-
-fn rollback_resource_operations(
-    transaction: &TransactionRecord,
-    planner: &WorkspaceEditPlanner<'_>,
-) -> Result<(), String> {
-    for operation in transaction.operations.iter().rev() {
+    for (operation, effect) in transaction.operations.iter().zip(&progress.effects).rev() {
+        require_manifest(planner, effect.after.as_ref().unwrap())?;
         match operation {
-            CanonicalOperation::Text { .. } => {}
-            CanonicalOperation::Create { path, .. } => {
-                let expected = manifest_for_path(&transaction.before_manifest, path)?;
-                let actual = inspect_manifest_path(planner, path)?;
-                if !expected.exists && actual.exists {
+            CanonicalOperation::Text { path, .. } | CanonicalOperation::Create { path, .. } => {
+                let before = manifest_for_path(&effect.before, path)?;
+                let after = manifest_for_path(effect.after.as_ref().unwrap(), path)?;
+                if before == after {
+                    continue;
+                }
+                if before.exists {
+                    restore_proven_text(transaction, planner, before, after)?;
+                } else {
                     let relative = planner.relative_path(path)?;
                     remove_capability_resource(planner.capability_root(), relative)
-                        .map_err(|error| error.to_string())?;
-                    flush_parent(path).map_err(|error| error.to_string())?;
+                        .map_err(|e| e.to_string())?;
+                    flush_parent(path).map_err(|e| e.to_string())?;
                 }
             }
             CanonicalOperation::Rename {
@@ -1451,79 +2089,141 @@ fn rollback_resource_operations(
                 old_path,
                 new_path,
                 ..
-            } => rollback_rename_operation(transaction, planner, *index, old_path, new_path)?,
+            } => {
+                if effect.before != *effect.after.as_ref().unwrap() {
+                    let proof = effect.after.as_ref().unwrap();
+                    rename_capability_resource(planner, new_path, old_path, proof)?;
+                    let undo = undo_resource_path(&transaction.artifact_directory, *index);
+                    if manifest_for_path(proof, &undo)?.exists {
+                        rename_capability_resource(planner, &undo, new_path, proof)?;
+                    }
+                }
+            }
             CanonicalOperation::Delete { index, path, .. } => {
-                rollback_delete_operation(transaction, planner, *index, path)?;
+                let undo = undo_resource_path(&transaction.artifact_directory, *index);
+                if manifest_for_path(effect.after.as_ref().unwrap(), &undo)?.exists {
+                    rename_capability_resource(
+                        planner,
+                        &undo,
+                        path,
+                        effect.after.as_ref().unwrap(),
+                    )?;
+                }
             }
         }
+        require_manifest(planner, &effect.before)?;
     }
-    Ok(())
+    let current = inspect_transaction_manifest(planner, transaction)
+        .map_err(|_| "Restored state cannot be inspected.".to_owned())?;
+    // The operation-order undo above must restore everything; never guess from an inode match.
+    if !manifest_mismatches(&transaction.before_manifest, &current).is_empty() {
+        return Err("The rollback manifest does not match its preconditions.".to_owned());
+    }
+    Ok(current)
 }
 
-fn rollback_rename_operation(
+fn rollback_text_bytes(
     transaction: &TransactionRecord,
     planner: &WorkspaceEditPlanner<'_>,
-    operation_index: u64,
-    old_path: &Path,
-    new_path: &Path,
-) -> Result<(), String> {
-    let expected_old = manifest_for_path(&transaction.before_manifest, old_path)?;
-    let actual_old = inspect_manifest_path(planner, old_path)?;
-    if !actual_old.exists {
-        let actual_new = inspect_manifest_path(planner, new_path)?;
-        if !actual_new.exists
-            || (expected_old.exists && !same_resource_identity(expected_old, &actual_new))
+    expected: &ManifestEntry,
+) -> Result<(Vec<u8>, Option<File>), String> {
+    let digest = expected
+        .content_digest
+        .as_ref()
+        .ok_or("Missing undo text digest.")?;
+    if let Some(original) = transaction.before_manifest.iter().find(|entry| {
+        entry.exists
+            && entry.identity_digest == expected.identity_digest
+            && entry.content_digest == expected.content_digest
+    }) {
+        let path = backup_path_for(&transaction.backups, &original.path)
+            .ok_or("Missing original text backup.")?;
+        let mut options = CapabilityOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut source = planner
+            .capability_root()
+            .open_with(planner.relative_path(&path)?, &options)
+            .map_err(|e| e.to_string())?
+            .into_std();
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if digest_raw_bytes(&bytes) != *digest {
+            return Err("Original rollback backup content changed.".to_owned());
+        }
+        let actual = inspect_manifest_path(planner, &path)?;
+        if actual.metadata_digest != expected.metadata_digest {
+            return Err("Original rollback backup metadata changed.".to_owned());
+        }
+        return Ok((bytes, Some(source)));
+    }
+    if *digest == digest_raw_bytes(b"") {
+        return Ok((Vec::new(), None));
+    }
+    for operation in &transaction.operations {
+        if let CanonicalOperation::Text {
+            index,
+            after_digest,
+            ..
+        } = operation
+            && after_digest == digest
         {
-            return Err("The renamed resource identity is unavailable for rollback.".to_owned());
-        }
-        rename_capability_resource(planner, new_path, old_path)?;
-    } else if expected_old.exists && !same_resource_identity(expected_old, &actual_old) {
-        return Err("The original rename source changed before rollback.".to_owned());
-    }
-
-    let expected_new = manifest_for_path(&transaction.before_manifest, new_path)?;
-    let undo_path = undo_resource_path(&transaction.artifact_directory, operation_index);
-    let undo = inspect_manifest_path(planner, &undo_path)?;
-    if undo.exists {
-        if expected_new.exists && !same_resource_identity(expected_new, &undo) {
-            return Err("The overwritten rename destination changed in staging.".to_owned());
-        }
-        if inspect_manifest_path(planner, new_path)?.exists {
-            return Err("The rename destination is occupied during rollback.".to_owned());
-        }
-        rename_capability_resource(planner, &undo_path, new_path)?;
-    } else {
-        let actual_new = inspect_manifest_path(planner, new_path)?;
-        if expected_new.exists && !same_resource_identity(expected_new, &actual_new) {
-            return Err("The original rename destination is unavailable for rollback.".to_owned());
-        }
-        if !expected_new.exists && actual_new.exists {
-            return Err("The rename destination remains occupied after rollback.".to_owned());
+            let path = staged_text_path(&transaction.artifact_directory, *index);
+            let mut options = CapabilityOpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut source = planner
+                .capability_root()
+                .open_with(planner.relative_path(&path)?, &options)
+                .map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            source.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if digest_raw_bytes(&bytes) != *digest {
+                return Err("Intermediate rollback text changed.".to_owned());
+            }
+            return Ok((bytes, None));
         }
     }
-    Ok(())
+    Err("No canonical content proves the intermediate text state.".to_owned())
 }
 
-fn rollback_delete_operation(
+fn restore_proven_text(
     transaction: &TransactionRecord,
     planner: &WorkspaceEditPlanner<'_>,
-    operation_index: u64,
-    path: &Path,
+    before: &ManifestEntry,
+    after: &ManifestEntry,
 ) -> Result<(), String> {
-    let expected = manifest_for_path(&transaction.before_manifest, path)?;
-    let actual = inspect_manifest_path(planner, path)?;
-    let undo_path = undo_resource_path(&transaction.artifact_directory, operation_index);
-    let undo = inspect_manifest_path(planner, &undo_path)?;
-    if actual.exists {
-        if !undo.exists && (!expected.exists || same_resource_identity(expected, &actual)) {
-            return Ok(());
-        }
-        return Err("The deleted resource path is occupied during rollback.".to_owned());
+    let (bytes, backup) = rollback_text_bytes(transaction, planner, before)?;
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let mut output = planner
+        .capability_root()
+        .open_with(planner.relative_path(&before.path)?, &options)
+        .map_err(|e| e.to_string())?
+        .into_std();
+    let identity = open_file_identity(&output).map_err(|e| e.to_string())?;
+    let mut current = Vec::new();
+    output
+        .read_to_end(&mut current)
+        .map_err(|e| e.to_string())?;
+    if after.identity_digest.as_deref() != Some(&identity)
+        || after.content_digest != Some(digest_raw_bytes(&current))
+    {
+        return Err("Text changed before rollback truncation.".to_owned());
     }
-    if !undo.exists || (expected.exists && !same_resource_identity(expected, &undo)) {
-        return Err("The deleted resource identity is unavailable for rollback.".to_owned());
+    require_manifest(planner, std::slice::from_ref(after))?;
+    output
+        .set_len(0)
+        .and_then(|()| output.seek(SeekFrom::Start(0)))
+        .and_then(|_| output.write_all(&bytes))
+        .map_err(|e| e.to_string())?;
+    if let Some(source) = backup {
+        preserve_open_file_metadata(
+            &source,
+            &output,
+            &source.metadata().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     }
-    rename_capability_resource(planner, &undo_path, path)
+    output.sync_all().map_err(|e| e.to_string())
 }
 
 fn manifest_for_path<'a>(
@@ -1548,50 +2248,38 @@ fn inspect_manifest_path(
         .ok_or_else(|| "A rollback resource manifest is missing.".to_owned())
 }
 
-fn same_resource_identity(expected: &ManifestEntry, actual: &ManifestEntry) -> bool {
-    expected.exists
-        && actual.exists
-        && expected.resource_kind == actual.resource_kind
-        && expected.identity_digest == actual.identity_digest
-}
-
 fn rename_capability_resource(
     planner: &WorkspaceEditPlanner<'_>,
     from: &Path,
     to: &Path,
+    proof: &[ManifestEntry],
 ) -> Result<(), String> {
     let root = planner.capability_root();
     let from_relative = planner.relative_path(from)?;
     let to_relative = planner.relative_path(to)?;
+    if !manifest_for_path(proof, from)?.exists {
+        return Err("The rollback rename source lacks proof.".to_owned());
+    }
+    let mut expected = proof
+        .iter()
+        .filter(|entry| entry.path.starts_with(from))
+        .cloned()
+        .collect::<Vec<_>>();
+    expected.push(missing_manifest(to));
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    // Each leg needs a fresh check: the previous rename and its flush can admit an external writer.
+    require_manifest(planner, &expected)?;
+    #[cfg(windows)]
+    let handle = retain_move_handle(planner, manifest_for_path(proof, from)?)?;
     root.rename(from_relative, root, to_relative)
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    preserve_move_metadata(&handle).map_err(|e| e.to_string())?;
     flush_parent(from).map_err(|error| error.to_string())?;
     if from.parent() != to.parent() {
         flush_parent(to).map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-fn restore_file_backup(
-    planner: &WorkspaceEditPlanner<'_>,
-    backup_path: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    let mut source = File::open(backup_path)?;
-    let metadata = source.metadata()?;
-    let relative = planner
-        .relative_path(destination)
-        .map_err(std::io::Error::other)?;
-    let mut options = CapabilityOpenOptions::new();
-    options
-        .write(true)
-        .truncate(true)
-        .follow(FollowSymlinks::No);
-    let mut output = planner.capability_root().open_with(relative, &options)?;
-    std::io::copy(&mut source, &mut output)?;
-    let output = output.into_std();
-    preserve_open_file_metadata(&source, &output, &metadata)?;
-    output.sync_all()
 }
 
 fn preserve_open_file_metadata(
@@ -1614,6 +2302,11 @@ fn preserve_open_file_metadata(
     let times = fs::FileTimes::new()
         .set_accessed(metadata.accessed()?)
         .set_modified(metadata.modified()?);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(metadata.created()?)
+    };
     destination.set_times(times)
 }
 
@@ -1847,26 +2540,27 @@ fn copy_native_flags(
 }
 
 fn copy_file_times(destination: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
-    #[cfg(windows)]
-    if metadata.is_dir() {
-        // Opening directories for timestamp updates requires
-        // FILE_FLAG_BACKUP_SEMANTICS; directory timestamps are not part of
-        // the v1 Mutation metadata digest on Windows.
-        return Ok(());
-    }
     let times = std::fs::FileTimes::new()
         .set_accessed(metadata.accessed()?)
         .set_modified(metadata.modified()?);
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(metadata.created()?)
+    };
     open_file_for_timestamp_update(destination)?.set_times(times)
 }
 
 #[cfg(windows)]
 fn open_file_for_timestamp_update(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
 
     fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }
 
@@ -2635,12 +3329,7 @@ mod tests {
                 store.write_transaction(&transaction).unwrap();
                 stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
                 if committed {
-                    commit_operations(
-                        &planner,
-                        &transaction.artifact_directory,
-                        &transaction.operations,
-                    )
-                    .unwrap();
+                    commit_operations(&planner, &transaction).unwrap();
                 }
                 let original_digest = transaction.manifest_digest.clone();
                 let reconciled =
@@ -2760,6 +3449,776 @@ mod tests {
         }
         assert!(source.is_dir());
         assert!(store.list_transactions().unwrap().is_empty());
+    }
+
+    fn provenance_transaction(
+        workspace: &Path,
+        planner: &WorkspaceEditPlanner<'_>,
+        edit: Value,
+    ) -> TransactionRecord {
+        let plan = planner.plan_workspace_edit(&edit).unwrap().plan;
+        let id = "txn_00000000000000000000000000000000";
+        let artifact_directory = workspace.join(format!(".lspctl-{id}"));
+        TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: id.to_owned(),
+            preview_id: "prv_00000000000000000000000000000000".to_owned(),
+            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+            workspace_path: workspace.to_path_buf(),
+            workspace_uri: url::Url::from_directory_path(workspace)
+                .unwrap()
+                .to_string(),
+            state: TransactionState::Committing,
+            started_at: now_rfc3339(),
+            backups: planned_backups(&plan.before_manifest, &artifact_directory),
+            artifact_directory,
+            operations: plan.operations,
+            manifest_digest: manifest_digest(&plan.before_manifest),
+            observed_manifest: plan.before_manifest.clone(),
+            before_manifest: plan.before_manifest,
+            intended_manifest: plan.intended_manifest,
+            cleanup_pending: false,
+        }
+    }
+
+    fn text_change(path: &Path, before_len: u64, text: &str) -> Value {
+        json!({"textDocument": {"uri": url::Url::from_file_path(path).unwrap(), "version": null},
+            "edits": [{"range": {"start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": before_len}}, "newText": text}]})
+    }
+
+    fn assert_unproven_recovery_preserves_workspace(
+        transaction: &TransactionRecord,
+        planner: &WorkspaceEditPlanner<'_>,
+    ) {
+        let state = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let (previews, receipts, mutation) = super::super::default_mutation_settings();
+        let observed = inspect_transaction_manifest(planner, transaction).unwrap();
+        store.write_transaction(transaction).unwrap();
+        let reconciled = reconcile_recovery_status(
+            &store,
+            store.read_transaction(&transaction.transaction_id).unwrap(),
+            &previews,
+            &mutation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reconciled.state, TransactionState::RecoveryRequired);
+        assert_eq!(reconciled.observed_manifest, observed);
+        assert_eq!(
+            recover_rollback(
+                &store,
+                &reconciled.transaction_id,
+                &reconciled.manifest_digest,
+                &previews,
+                &receipts,
+                &mutation,
+            )
+            .unwrap_err()
+            .code,
+            "recovery_failed"
+        );
+        assert_eq!(
+            inspect_transaction_manifest(planner, transaction).unwrap(),
+            observed
+        );
+        assert!(transaction.artifact_directory.exists());
+        assert_eq!(
+            store
+                .read_transaction(&transaction.transaction_id)
+                .unwrap()
+                .state,
+            TransactionState::RecoveryRequired
+        );
+        let target = transaction.workspace_path.join("blocked-create");
+        let edit = json!({"documentChanges": [{"kind": "create", "uri": url::Url::from_file_path(&target).unwrap()}]});
+        let mut context = test_application_context(&store, &previews, &receipts, &mutation);
+        let id = persist_test_preview(
+            &context,
+            &transaction.workspace_path,
+            edit.clone(),
+            planner.plan_workspace_edit(&edit).unwrap(),
+        );
+        assert_eq!(
+            apply_preview(&mut context, &id).unwrap_err().code,
+            "recovery_required"
+        );
+        assert!(!target.exists());
+        assert!(store.list_receipts().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_provenance_windows_preserves_external_acl_change() {
+        use std::{os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Security::{
+                ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, GetAce,
+                GetSecurityDescriptorDacl, SetKernelObjectSecurity,
+            },
+            Storage::FileSystem::FILE_WRITE_DATA,
+            System::SystemServices::ACCESS_ALLOWED_ACE_TYPE,
+        };
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source");
+        fs::write(&source, b"preserve these bytes").unwrap();
+        let (previews, _, mutation) = super::super::default_mutation_settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let transaction = provenance_transaction(
+            workspace.path(),
+            &planner,
+            json!({"documentChanges": [{"kind": "delete", "uri": url::Url::from_file_path(&source).unwrap()}]}),
+        );
+        stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+        let handle = retain_move_handle(
+            &planner,
+            manifest_for_path(&transaction.before_manifest, &source).unwrap(),
+        )
+        .unwrap();
+        let undo = undo_resource_path(
+            &transaction.artifact_directory,
+            operation_index(&transaction.operations[0]),
+        );
+        planner
+            .capability_root()
+            .rename(
+                planner.relative_path(&source).unwrap(),
+                planner.capability_root(),
+                planner.relative_path(&undo).unwrap(),
+            )
+            .unwrap();
+
+        // Change an actual permission, not the inheritance marker altered by the move.
+        let mut external = move_security_descriptor(&handle.file).unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    external.as_mut_ptr().cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let mut changed = false;
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+            if u32::from(unsafe { (*ace.cast::<ACE_HEADER>()).AceType }) == ACCESS_ALLOWED_ACE_TYPE
+            {
+                unsafe {
+                    (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask ^= FILE_WRITE_DATA;
+                }
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "the isolated file must have an allowed ACE");
+        assert_ne!(
+            unsafe {
+                SetKernelObjectSecurity(
+                    handle.file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION,
+                    external.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+        let external = move_security_descriptor(&handle.file).unwrap();
+        assert_ne!(
+            without_inherited_ace_flags(external.clone()).unwrap(),
+            without_inherited_ace_flags(handle.security_descriptor.clone()).unwrap()
+        );
+        let observed = inspect_manifest_path(&planner, &undo).unwrap();
+
+        assert!(preserve_move_metadata(&handle).is_err());
+        assert_eq!(move_security_descriptor(&handle.file).unwrap(), external);
+        assert_eq!(inspect_manifest_path(&planner, &undo).unwrap(), observed);
+        assert_eq!(fs::read(&undo).unwrap(), b"preserve these bytes");
+        assert!(transaction.artifact_directory.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rollback_provenance_windows_preserves_copy_and_move_metadata() {
+        use std::{os::windows::fs::FileTimesExt, time::SystemTime};
+
+        for directory in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            let destination = workspace.path().join("destination");
+            for (path, seconds) in [(&source, 946_684_800), (&destination, 1_262_304_000)] {
+                if directory {
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("child"), b"content").unwrap();
+                } else {
+                    fs::write(path, b"content").unwrap();
+                }
+                // Distinct known creation times expose both copy loss and NTFS rename tunneling.
+                open_file_for_timestamp_update(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_created(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [{"kind": "rename",
+                    "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&destination).unwrap(),
+                    "options": {"overwrite": true}}]}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            for before in transaction
+                .before_manifest
+                .iter()
+                .filter(|entry| entry.exists)
+            {
+                let backup = backup_path_for(&transaction.backups, &before.path).unwrap();
+                assert_eq!(
+                    inspect_manifest_path(&planner, &backup)
+                        .unwrap()
+                        .metadata_digest,
+                    before.metadata_digest,
+                    "backup metadata: {}",
+                    before.path.display()
+                );
+            }
+            commit_operations(&planner, &transaction).unwrap();
+            let restored = rollback_transaction(&transaction, &planner).unwrap();
+            assert!(manifest_mismatches(&transaction.before_manifest, &restored).is_empty());
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_rechecks_each_rename_leg() {
+        for conflict in ["destination", "undo"] {
+            let workspace = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            let destination = workspace.path().join("destination");
+            fs::write(&source, b"source").unwrap();
+            fs::write(&destination, b"destination").unwrap();
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [{"kind": "rename",
+                    "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&destination).unwrap(),
+                    "options": {"overwrite": true}}]}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            commit_operations(&planner, &transaction).unwrap();
+            let undo = undo_resource_path(
+                &transaction.artifact_directory,
+                operation_index(&transaction.operations[0]),
+            );
+            let progress = read_progress(&transaction, &planner).unwrap();
+            let proof = progress.effects[0].after.as_ref().unwrap();
+            // The first undo leg completes; an external writer acts before the second.
+            rename_capability_resource(&planner, &destination, &source, proof).unwrap();
+            let changed = if conflict == "destination" {
+                &destination
+            } else {
+                &undo
+            };
+            fs::write(changed, b"external").unwrap();
+            let external = inspect_manifest_path(&planner, changed).unwrap();
+            let result = rename_capability_resource(&planner, &undo, &destination, proof);
+            assert!(result.is_err(), "the second rename must recheck {conflict}");
+            assert_eq!(fs::read(changed).unwrap(), b"external");
+            assert_eq!(inspect_manifest_path(&planner, changed).unwrap(), external);
+            assert_eq!(fs::read(&source).unwrap(), b"source");
+            assert!(transaction.artifact_directory.exists());
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_preserves_unwritten_text() {
+        for after_first in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let first = workspace.path().join("first");
+            let second = workspace.path().join("second");
+            fs::write(&first, b"old").unwrap();
+            fs::write(&second, b"old").unwrap();
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [text_change(&first, 3, "new"), text_change(&second, 3, "new")]}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            if !after_first {
+                fs::write(&second, b"external").unwrap();
+            }
+            let result = commit_operations_with_writer(&planner, &transaction, |progress| {
+                write_progress(&transaction, &planner, progress)?;
+                if after_first && progress.effects.len() == 1 && progress.effects[0].after.is_some()
+                {
+                    fs::write(&second, b"external").unwrap();
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            let external = inspect_manifest_path(&planner, &second).unwrap();
+            let result = rollback_transaction(&transaction, &planner);
+            assert_eq!(fs::read(&second).unwrap(), b"external");
+            assert_eq!(inspect_manifest_path(&planner, &second).unwrap(), external);
+            assert!(result.is_err(), "external content requires Recovery");
+            assert_eq!(
+                fs::read(&first).unwrap(),
+                if after_first { b"new" } else { b"old" }
+            );
+            assert_unproven_recovery_preserves_workspace(&transaction, &planner);
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_preserves_uncreated_target() {
+        let workspace = TempDir::new().unwrap();
+        let target = workspace.path().join("created");
+        let (previews, _, mutation) = super::super::default_mutation_settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let transaction = provenance_transaction(
+            workspace.path(),
+            &planner,
+            json!({"documentChanges": [{"kind": "create", "uri": url::Url::from_file_path(&target).unwrap()}]}),
+        );
+        stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+        fs::write(&target, b"external").unwrap();
+        let external = inspect_manifest_path(&planner, &target).unwrap();
+        assert!(commit_operations(&planner, &transaction).is_err());
+        let result = rollback_transaction(&transaction, &planner);
+        assert_eq!(fs::read(&target).unwrap(), b"external");
+        assert_eq!(inspect_manifest_path(&planner, &target).unwrap(), external);
+        assert!(result.is_err());
+        assert_unproven_recovery_preserves_workspace(&transaction, &planner);
+    }
+
+    #[test]
+    fn rollback_provenance_preserves_postcommit_editor_change() {
+        for (create, replace) in [(false, false), (false, true), (true, false), (true, true)] {
+            let workspace = TempDir::new().unwrap();
+            let target = workspace.path().join("target");
+            if !create {
+                fs::write(&target, b"old").unwrap();
+            }
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let operation = if create {
+                json!({"kind": "create", "uri": url::Url::from_file_path(&target).unwrap()})
+            } else {
+                text_change(&target, 3, "new")
+            };
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [operation]}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            commit_operations(&planner, &transaction).unwrap();
+            if replace {
+                fs::rename(&target, workspace.path().join("replaced-original")).unwrap();
+            }
+            fs::write(&target, b"external").unwrap();
+            let external = inspect_manifest_path(&planner, &target).unwrap();
+            let result = rollback_transaction(&transaction, &planner);
+            assert_eq!(fs::read(&target).unwrap(), b"external");
+            assert_eq!(inspect_manifest_path(&planner, &target).unwrap(), external);
+            assert!(result.is_err());
+            assert_unproven_recovery_preserves_workspace(&transaction, &planner);
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_progress_round_trips_and_rejects_invalid_evidence() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("file");
+        fs::write(&file, b"old").unwrap();
+        let (previews, _, mutation) = super::super::default_mutation_settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let transaction = provenance_transaction(
+            workspace.path(),
+            &planner,
+            json!({"documentChanges": [text_change(&file, 3, "new")]}),
+        );
+        stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+        commit_operations(&planner, &transaction).unwrap();
+        let path = transaction.artifact_directory.join(PROGRESS_FILE);
+        let bytes = fs::read(&path).unwrap();
+        let valid: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            read_progress(&transaction, &planner).unwrap().effects.len(),
+            1
+        );
+        for field in [
+            "version",
+            "transaction_id",
+            "operations_digest",
+            "before_digest",
+            "unknown",
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!(42);
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(read_progress(&transaction, &planner).is_err(), "{field}");
+        }
+        for invalid in [
+            {
+                let mut value = valid.clone();
+                value["effects"][0]["index"] = json!(99);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["effects"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(valid["effects"][0].clone());
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["effects"][0]["after"][0]["path"] = json!("/outside");
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["effects"][0]["after"][0]["contentDigest"] = json!("sha256:fake");
+                value
+            },
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(read_progress(&transaction, &planner).is_err());
+            assert!(rollback_transaction(&transaction, &planner).is_err());
+            assert_eq!(fs::read(&file).unwrap(), b"new");
+        }
+        File::create(&path)
+            .unwrap()
+            .set_len(progress_size_limit(&transaction).unwrap() + 1)
+            .unwrap();
+        assert!(read_progress(&transaction, &planner).is_err());
+        fs::write(&path, &bytes).unwrap();
+        fs::write(
+            transaction.artifact_directory.join(ARTIFACT_OWNER_FILE),
+            b"wrong owner",
+        )
+        .unwrap();
+        assert!(read_progress(&transaction, &planner).is_err());
+        fs::write(
+            transaction.artifact_directory.join(ARTIFACT_OWNER_FILE),
+            &transaction.transaction_id,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            let external = workspace.path().join("external-proof");
+            fs::write(&external, &bytes).unwrap();
+            std::os::unix::fs::symlink(&external, &path).unwrap();
+            assert!(read_progress(&transaction, &planner).is_err());
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert!(read_progress(&transaction, &planner).is_ok());
+        rollback_transaction(&transaction, &planner).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_provenance_uncertain_commit_requires_recovery() {
+        for boundary in ["before_effect", "after_effect", "after_durability"] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let file = workspace.path().join("file");
+            fs::write(&file, b"old").unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [text_change(&file, 3, "new")]}),
+            );
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            store.write_transaction(&transaction).unwrap();
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            let result = commit_operations_with_writer(&planner, &transaction, |progress| {
+                let completed = progress.effects.last().unwrap().after.is_some();
+                if (!completed && boundary == "before_effect")
+                    || (completed && boundary == "after_effect")
+                {
+                    if !completed {
+                        write_progress(&transaction, &planner, progress)?;
+                    }
+                    return Err("simulated interrupted progress write".to_owned());
+                }
+                write_progress(&transaction, &planner, progress)?;
+                if completed && boundary == "after_durability" {
+                    return Err("simulated crash after durable completion".to_owned());
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            let id = transaction.transaction_id.clone();
+            let artifacts = transaction.artifact_directory.clone();
+            let transaction = reconcile_recovery_status(
+                &store,
+                store.read_transaction(&id).unwrap(),
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(transaction.state, TransactionState::RecoveryRequired);
+            let result = recover_rollback(
+                &store,
+                &id,
+                &transaction.manifest_digest,
+                &previews,
+                &receipts,
+                &mutation,
+            );
+            if boundary == "after_effect" {
+                assert_eq!(result.unwrap_err().code, "recovery_failed");
+                assert_eq!(fs::read(&file).unwrap(), b"new");
+                assert!(artifacts.exists());
+                assert_eq!(
+                    store.read_transaction(&id).unwrap().state,
+                    TransactionState::RecoveryRequired
+                );
+            } else {
+                assert_eq!(result.unwrap()["outcome"], "restored");
+                assert_eq!(fs::read(&file).unwrap(), b"old");
+                assert!(!artifacts.exists());
+                assert!(store.list_transactions().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_restores_completed_ordered_effects() {
+        for case in [
+            "text",
+            "repeated",
+            "create",
+            "overwrite",
+            "rename_overwrite",
+            "delete",
+            "create_text_rename",
+            "text_rename_text",
+            "delete_create",
+            "directory",
+        ] {
+            let workspace = TempDir::new().unwrap();
+            let first = workspace.path().join("first");
+            let second = workspace.path().join("second");
+            if case != "create" && case != "create_text_rename" {
+                fs::write(&first, b"old").unwrap();
+            }
+            if case == "rename_overwrite" {
+                fs::write(&second, b"destination").unwrap();
+            }
+            if case == "directory" {
+                fs::remove_file(&first).unwrap();
+                fs::create_dir_all(first.join("nested")).unwrap();
+                fs::write(first.join("nested/file"), b"old").unwrap();
+                fs::create_dir(&second).unwrap();
+                fs::write(second.join("other"), b"other").unwrap();
+            }
+            let uri = |path: &Path| url::Url::from_file_path(path).unwrap();
+            let create =
+                json!({"kind": "create", "uri": uri(&first), "options": {"overwrite": true}});
+            let rename = json!({"kind": "rename", "oldUri": uri(&first), "newUri": uri(&second), "options": {"overwrite": true}});
+            let delete = json!({"kind": "delete", "uri": uri(&first)});
+            let operations = match case {
+                "text" => vec![text_change(&first, 3, "new")],
+                "repeated" => vec![text_change(&first, 3, "one"), text_change(&first, 3, "two")],
+                "create" | "overwrite" => vec![create],
+                "rename_overwrite" => vec![rename],
+                "delete" => vec![delete],
+                "create_text_rename" => vec![create, text_change(&first, 0, "new"), rename],
+                "text_rename_text" => vec![
+                    text_change(&first, 3, "one"),
+                    rename,
+                    text_change(&second, 3, "two"),
+                ],
+                "delete_create" => vec![delete, create, text_change(&first, 0, "new")],
+                "directory" => vec![
+                    rename,
+                    json!({"kind": "delete", "uri": uri(&second.join("nested/file"))}),
+                ],
+                _ => unreachable!(),
+            };
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": operations}),
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            commit_operations(&planner, &transaction).unwrap();
+            let restored = rollback_transaction(&transaction, &planner)
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert!(
+                manifest_mismatches(&transaction.before_manifest, &restored).is_empty(),
+                "{case}"
+            );
+            if case == "create" || case == "create_text_rename" {
+                assert!(!first.exists());
+            } else if case == "directory" {
+                assert_eq!(fs::read(first.join("nested/file")).unwrap(), b"old");
+                assert_eq!(fs::read(second.join("other")).unwrap(), b"other");
+            } else {
+                assert_eq!(fs::read(&first).unwrap(), b"old");
+            }
+            if case == "rename_overwrite" {
+                assert_eq!(fs::read(&second).unwrap(), b"destination");
+            }
+            cleanup_transaction_artifacts(&transaction).unwrap();
+        }
+    }
+
+    #[test]
+    fn rollback_provenance_legacy_journal_is_readable_but_not_authority() {
+        for changed in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let file = workspace.path().join("file");
+            fs::write(&file, b"old").unwrap();
+            let (previews, receipts, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(
+                workspace.path(),
+                &planner,
+                json!({"documentChanges": [text_change(&file, 3, "new")]}),
+            );
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            store.write_transaction(&transaction).unwrap();
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            assert!(!transaction.artifact_directory.join(PROGRESS_FILE).exists());
+            if changed {
+                fs::write(&file, b"external").unwrap();
+            }
+            let external = inspect_manifest_path(&planner, &file).unwrap();
+            let id = transaction.transaction_id.clone();
+            let artifacts = transaction.artifact_directory.clone();
+            let transaction = reconcile_recovery_status(
+                &store,
+                store.read_transaction(&id).unwrap(),
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .unwrap();
+            let result = recover_rollback(
+                &store,
+                &id,
+                &transaction.manifest_digest,
+                &previews,
+                &receipts,
+                &mutation,
+            );
+            if changed {
+                assert_eq!(result.unwrap_err().code, "recovery_failed");
+                assert_eq!(fs::read(&file).unwrap(), b"external");
+                assert_eq!(inspect_manifest_path(&planner, &file).unwrap(), external);
+                assert!(artifacts.exists());
+                assert_eq!(
+                    store.read_transaction(&id).unwrap().state,
+                    TransactionState::RecoveryRequired
+                );
+                let accepted = recover_accept_current(
+                    &store,
+                    &id,
+                    &transaction.manifest_digest,
+                    &previews,
+                    &receipts,
+                    &mutation,
+                )
+                .unwrap();
+                assert_eq!(accepted["outcome"], "accepted_current");
+                assert_eq!(fs::read(&file).unwrap(), b"external");
+            } else {
+                assert_eq!(result.unwrap()["outcome"], "restored");
+            }
+            assert!(!artifacts.exists());
+            assert!(store.list_transactions().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -3078,7 +4537,7 @@ mod tests {
             cleanup_pending: false,
         };
         stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
-        commit_operations(&planner, &artifact_directory, &transaction.operations).unwrap();
+        commit_operations(&planner, &transaction).unwrap();
 
         let restored = rollback_transaction(&transaction, &planner).unwrap();
 
@@ -3092,83 +4551,102 @@ mod tests {
 
     #[test]
     fn abandoned_commit_is_sealed_and_rolled_back_without_replaying_writes() {
-        let workspace = TempDir::new().unwrap();
-        let state = TempDir::new().unwrap();
-        let file = workspace.path().join("main.rs");
-        fs::write(&file, "old\n").unwrap();
-        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
-        let preview_limits = PreviewSettings {
-            max_count: 64,
-            max_total_bytes: 1_000_000,
-            max_document_text_bytes: 1_000_000,
-            max_text_bytes: 1_000_000,
-        };
-        let receipt_limits = ReceiptSettings { max_count: 100 };
-        let mutation_limits = MutationSettings {
-            application_lock_timeout: "1s".to_owned(),
-            max_entries: 100,
-            max_recursion_depth: 20,
-            max_rollback_bytes: 1_000_000,
-            max_staged_text_bytes: 1_000_000,
-            max_preauthorized_callbacks: 64,
-        };
-        let workspace_uri = url::Url::from_directory_path(workspace.path())
-            .unwrap()
-            .to_string();
-        let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
-        let planner = WorkspaceEditPlanner::open(
-            workspace.path(),
-            PositionEncoding::Utf8,
-            &preview_limits,
-            &mutation_limits,
-        )
-        .unwrap();
-        let planned = planner
+        for durable in [false, true] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let file = workspace.path().join("main.rs");
+            fs::write(&file, "old\n").unwrap();
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            let preview_limits = PreviewSettings {
+                max_count: 64,
+                max_total_bytes: 1_000_000,
+                max_document_text_bytes: 1_000_000,
+                max_text_bytes: 1_000_000,
+            };
+            let receipt_limits = ReceiptSettings { max_count: 100 };
+            let mutation_limits = MutationSettings {
+                application_lock_timeout: "1s".to_owned(),
+                max_entries: 100,
+                max_recursion_depth: 20,
+                max_rollback_bytes: 1_000_000,
+                max_staged_text_bytes: 1_000_000,
+                max_preauthorized_callbacks: 64,
+            };
+            let workspace_uri = url::Url::from_directory_path(workspace.path())
+                .unwrap()
+                .to_string();
+            let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf8,
+                &preview_limits,
+                &mutation_limits,
+            )
+            .unwrap();
+            let planned = planner
             .plan_workspace_edit(&json!({"changes": {file_uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "longer"}]}}))
             .unwrap();
-        let transaction_id = "txn_00000000000000000000000000000000";
-        let artifact_directory = workspace.path().join(format!(".lspctl-{transaction_id}"));
-        let transaction = TransactionRecord {
-            format_version: MUTATION_STATE_VERSION,
-            transaction_id: transaction_id.to_owned(),
-            preview_id: "prv_00000000000000000000000000000000".to_owned(),
-            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
-            workspace_path: workspace.path().to_path_buf(),
-            workspace_uri: workspace_uri.clone(),
-            state: TransactionState::Committing,
-            started_at: now_rfc3339(),
-            artifact_directory: artifact_directory.clone(),
-            backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
-            operations: planned.plan.operations.clone(),
-            before_manifest: planned.plan.before_manifest.clone(),
-            intended_manifest: planned.plan.intended_manifest.clone(),
-            observed_manifest: planned.plan.before_manifest.clone(),
-            manifest_digest: manifest_digest(&planned.plan.before_manifest),
-            cleanup_pending: false,
-        };
-        store.write_transaction(&transaction).unwrap();
-        stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
-        commit_operations(&planner, &artifact_directory, &transaction.operations).unwrap();
+            let transaction_id = "txn_00000000000000000000000000000000";
+            let artifact_directory = workspace.path().join(format!(".lspctl-{transaction_id}"));
+            let transaction = TransactionRecord {
+                format_version: MUTATION_STATE_VERSION,
+                transaction_id: transaction_id.to_owned(),
+                preview_id: "prv_00000000000000000000000000000000".to_owned(),
+                receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+                workspace_path: workspace.path().to_path_buf(),
+                workspace_uri: workspace_uri.clone(),
+                state: TransactionState::Committing,
+                started_at: now_rfc3339(),
+                artifact_directory: artifact_directory.clone(),
+                backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
+                operations: planned.plan.operations.clone(),
+                before_manifest: planned.plan.before_manifest.clone(),
+                intended_manifest: planned.plan.intended_manifest.clone(),
+                observed_manifest: planned.plan.before_manifest.clone(),
+                manifest_digest: manifest_digest(&planned.plan.before_manifest),
+                cleanup_pending: false,
+            };
+            store.write_transaction(&transaction).unwrap();
+            stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
+            let commit = commit_operations_with_writer(&planner, &transaction, |progress| {
+                if !durable && progress.effects.last().unwrap().after.is_some() {
+                    return Err("simulated crash before completed evidence".to_owned());
+                }
+                write_progress(&transaction, &planner, progress)
+            });
+            assert_eq!(commit.is_ok(), durable);
 
-        let transaction =
-            reconcile_recovery_status(&store, transaction, &preview_limits, &mutation_limits)
-                .unwrap()
-                .unwrap();
-        assert_eq!(transaction.state, TransactionState::RecoveryRequired);
-        assert_eq!(fs::read_to_string(&file).unwrap(), "longer\n");
+            let transaction = reconcile_recovery_status(
+                &store,
+                store.read_transaction(transaction_id).unwrap(),
+                &preview_limits,
+                &mutation_limits,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(transaction.state, TransactionState::RecoveryRequired);
+            assert_eq!(fs::read_to_string(&file).unwrap(), "longer\n");
 
-        let result = recover_rollback(
-            &store,
-            transaction_id,
-            &transaction.manifest_digest,
-            &preview_limits,
-            &receipt_limits,
-            &mutation_limits,
-        )
-        .unwrap();
+            let result = recover_rollback(
+                &store,
+                transaction_id,
+                &transaction.manifest_digest,
+                &preview_limits,
+                &receipt_limits,
+                &mutation_limits,
+            );
 
-        assert_eq!(result["outcome"], "restored");
-        assert_eq!(fs::read_to_string(file).unwrap(), "old\n");
-        assert!(store.read_transaction(transaction_id).is_err());
+            if durable {
+                assert_eq!(result.unwrap()["outcome"], "restored");
+                assert_eq!(fs::read_to_string(file).unwrap(), "old\n");
+                assert!(store.read_transaction(transaction_id).is_err());
+                assert!(!artifact_directory.exists());
+            } else {
+                assert_eq!(result.unwrap_err().code, "recovery_failed");
+                assert_eq!(fs::read_to_string(&file).unwrap(), "longer\n");
+                assert!(artifact_directory.exists());
+                assert_unproven_recovery_preserves_workspace(&transaction, &planner);
+            }
+        }
     }
 }
