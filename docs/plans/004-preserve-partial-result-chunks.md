@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** S
 - **Risk:** LOW
@@ -136,12 +136,35 @@ The three named integration tests above are required. Use the existing failure t
 
 ## Done criteria
 
-- [ ] All three named boundary tests are present in `--list` output and pass.
-- [ ] Existing public failure shape/context/trace test passes.
-- [ ] Full tests, formatting, Clippy, schema check, and `git diff --check` exit 0.
-- [ ] No public schema or Owner protocol version changed.
-- [ ] `git status --short` contains no new out-of-scope modification.
-- [ ] Row 004 in the index records DONE and verification evidence, or BLOCKED with its cause.
+- [x] All three named boundary tests are present in `--list` output and pass.
+- [x] Existing public failure shape/context/trace test passes.
+- [x] Full tests, formatting, Clippy, schema check, and `git diff --check` exit 0.
+- [x] No public schema or Owner protocol version changed.
+- [x] `git status --short` contains no new out-of-scope modification.
+- [x] Row 004 in the index records DONE and verification evidence, or BLOCKED with its cause.
+
+## Verification results
+
+Implemented for #40 from `a35fd8051cdaa462e3d3d4429829570edb2ff149` in the operator's current checkout (already detached HEAD); the operator explicitly authorized a commit. No branch was switched or created. The working tree was initially clean. The required drift check against `5268c6a` showed no changes in the four scoped implementation files.
+
+| Gate | Result |
+| --- | --- |
+| Baseline `cargo test --locked --all-targets --features fake-server` | 108 passed |
+| `cargo test --locked --features fake-server --test owner_lifecycle owner_partial_results_ -- --list` | Exactly the three required test names |
+| Focused red gate | Success regression failed with `invalid_server_result`, expected `an array partial result` at `$partial[0]`; both failure regressions passed |
+| Focused green gate | All three passed after preserving chunks |
+| Existing failure contract, exact filter | 1 passed |
+| `cargo test --locked --bin lspctl query::tests` | 16 passed, including array and object-shaped diagnostic mergers |
+| Final `cargo test --locked --all-targets --features fake-server` | 111 passed |
+| `cargo fmt --all -- --check` | Exit 0 |
+| `cargo clippy --locked --all-targets --features fake-server -- -D warnings` | Exit 0 |
+| `python scripts/release/check_schema.py` | Exit 0 |
+| `git diff --check` | Exit 0 |
+| Independent `/code-review` against the starting commit | Standards: 0 findings; Spec: 0 findings. Corrected the metadata description of the already-detached checkout. |
+
+The consumer audit confirmed success `partialResults` retains complete chunks. Server-error, settled cancellation/timeout, post-response stale-check, and Owner-failure paths use `attach_dispatch_evidence`; it and the immediate limit failure reuse the same one-level conversion. Empty flattened results remain omitted, and non-array chunks remain whole objects. Existing Query merger tests already cover document/workspace diagnostic objects, so `src/query.rs` needed no change. The limit regression checks two retained symbol objects, serialized chunk bytes, and the fixture's cancellation response. New boundary tests stop the isolated Owner explicitly on success and use bounded panic cleanup on assertion failure.
+
+Only the three scoped implementation files and the two permitted metadata files changed. No schema, protocol, manifest, dependency, scheduling, or diagnostic-persistence changes were needed. Verification ran on Linux; native macOS/Windows verification remains with CI.
 
 ## STOP conditions
 

@@ -86,7 +86,7 @@ struct ActiveQuery {
     timeout: Duration,
     cancellation: Option<QueryCancellation>,
     partial_token: Option<Value>,
-    partial_items: Vec<Value>,
+    partial_chunks: Vec<Value>,
     partial_bytes: usize,
     trace: Option<ProtocolTrace>,
     validated_documents: Vec<OwnerDocumentInput>,
@@ -902,7 +902,7 @@ impl LspRuntime {
                 timeout,
                 cancellation: None,
                 partial_token,
-                partial_items: Vec::new(),
+                partial_chunks: Vec::new(),
                 partial_bytes: 0,
                 trace,
                 validated_documents,
@@ -964,7 +964,7 @@ impl LspRuntime {
                         query.synchronization["postResponseChanged"] = Value::Array(changed);
                         let mut output = json!({
                             "result": result,
-                            "partialResults": query.partial_items,
+                            "partialResults": query.partial_chunks,
                             "applyEditLedger": query.apply_edit_ledger,
                             "serverProgress": self.progress.values().collect::<Vec<_>>(),
                             "synchronization": query.synchronization,
@@ -1020,13 +1020,11 @@ impl LspRuntime {
                             .map(|bytes| bytes.len())
                             .unwrap_or(usize::MAX),
                     );
-                    match value {
-                        Value::Array(items) => query.partial_items.extend(items),
-                        value => query.partial_items.push(value),
-                    }
+                    query.partial_chunks.push(value);
                     if query.partial_bytes > self.max_partial_result_bytes
                         && query.cancellation.is_none()
                     {
+                        let partial_items = partial_result_items(&query.partial_chunks);
                         let failure = json!({
                             "category": "query",
                             "code": "partial_result_too_large",
@@ -1037,9 +1035,9 @@ impl LspRuntime {
                             "data": {
                                 "limit": self.max_partial_result_bytes,
                                 "collectedBytes": query.partial_bytes,
-                                "partialItemCount": query.partial_items.len()
+                                "partialItemCount": partial_items.len()
                             },
-                            "partialResult": {"items": query.partial_items.clone(), "complete": false}
+                            "partialResult": {"items": partial_items, "complete": false}
                         });
                         query.cancellation = Some(QueryCancellation {
                             deadline: TokioInstant::now() + self.cancellation_grace,
@@ -2634,9 +2632,21 @@ fn attach_trace(failure: &mut Value, trace: Option<ProtocolTrace>) {
     }
 }
 
+fn partial_result_items(chunks: &[Value]) -> Vec<Value> {
+    chunks
+        .iter()
+        .flat_map(|chunk| match chunk {
+            Value::Array(items) => items.as_slice(),
+            chunk => std::slice::from_ref(chunk),
+        })
+        .cloned()
+        .collect()
+}
+
 fn attach_dispatch_evidence(failure: &mut Value, query: &mut ActiveQuery) {
-    if !query.partial_items.is_empty() {
-        failure["partialResult"] = json!({"items": query.partial_items.clone(), "complete": false});
+    let partial_items = partial_result_items(&query.partial_chunks);
+    if !partial_items.is_empty() {
+        failure["partialResult"] = json!({"items": partial_items, "complete": false});
     }
     if !query.apply_edit_ledger.is_empty() {
         failure["applyEditLedger"] = Value::Array(query.apply_edit_ledger.clone());
