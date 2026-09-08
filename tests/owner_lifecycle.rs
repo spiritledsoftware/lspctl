@@ -1200,7 +1200,7 @@ fn synchronization_raw(
 fn synchronization_input(path: &std::path::Path, text: &str) -> Value {
     use sha2::{Digest, Sha256};
     json!({
-        "path": path, "languageId": "rust",
+        "path": dunce::canonicalize(path).unwrap(), "languageId": "rust",
         "expectedDigest": format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())))
     })
 }
@@ -1370,7 +1370,15 @@ fn synchronization_retry_after_digest_mismatch_uses_current_text() {
 fn synchronization_retry_after_failed_read_closes_old_document() {
     let fixture = Fixture::new();
     let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    #[cfg(not(unix))]
     let path = fixture.workspace.join("retry.rs");
+    // Exercise aliased temporary paths on Linux too, not just macOS /var or Windows paths.
+    #[cfg(unix)]
+    let path = {
+        let alias = fixture._root.path().join("workspace-alias");
+        std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+        alias.join("retry.rs")
+    };
     fs::write(&path, "old text\n").unwrap();
     let uri = url::Url::from_file_path(dunce::canonicalize(&path).unwrap())
         .unwrap()
@@ -1382,12 +1390,14 @@ fn synchronization_retry_after_failed_read_closes_old_document() {
         Some("retry.rs"),
     );
     assert_eq!(started["result"], "old text\n");
+    // Like the CLI, snapshot the canonical input before the Owner observes the deletion.
+    let document = synchronization_input(&path, "old text\n");
     fs::remove_file(&path).unwrap();
     let rejected = synchronization_request(
         &fixture,
         &started["context"],
         json!({
-            "kind": "diagnostics", "documents": [synchronization_input(&path, "old text\n")]
+            "kind": "diagnostics", "documents": [document]
         }),
     );
     assert_eq!(rejected["ok"], false);

@@ -204,7 +204,14 @@ No DocumentStore abstraction, watcher, schema, configuration setting, dependency
 - Clippy `--all-targets --features fake-server -- -D warnings`, format check, schema check, stored-state check, and `git diff --check`: all exit **0**.
 - Scope inspection lists only the three allowed implementation files and this plan/index metadata; no untracked files or observed leftover fixture Owner/server process. Verified locally on Linux Rust **1.98.1**; native Windows/macOS and MSRV 1.89 were not run locally.
 
-Changes remain **uncommitted** for operator review; no push or PR was made.
+The implementation was committed as `6237fbe` and opened as PR #59 after operator approval.
+
+### Native CI follow-up
+
+- PR #59's initial macOS/Windows stable and MSRV jobs all failed the same explicit failed-read regression: the fake server retained one open Document. Linux and the post-response deletion test passed. Evidence: Actions runs `34252804986` and `34252809434`.
+- The private-protocol fixture sent its raw temporary path after deletion, unlike every production `OwnerDocumentInput` constructor, which sends the canonical `DocumentSnapshot.path`. macOS temporary-directory aliases and Windows path representations therefore produced a different URI from the stored Document; a failed read could not identify that Document for closure. No production caller uses the fixture's noncanonical input pattern.
+- Added a Unix symlink alias to the existing failed-read test, reproducing the native assertion deterministically on Linux: `cargo test --locked --features fake-server --test owner_lifecycle synchronization_retry_after_failed_read_closes_old_document` failed with open count **1**, expected **0** (`/tmp/47-ci-alias-red.log`). The shared fixture input helper now canonicalizes its path, and the deletion test prepares that input before removing the file, matching the real CLI snapshot/dispatch sequence. Assertions and production code are unchanged.
+- With the fixture corrected, all three focused regressions and all **139** tests pass (`/tmp/47-ci-full-green.log`); discovery still lists exactly three names. Clippy, formatting, schema, stored-state, and whitespace checks pass. Native CI rerun remains pending; this follow-up is uncommitted for review.
 
 ## STOP conditions
 
