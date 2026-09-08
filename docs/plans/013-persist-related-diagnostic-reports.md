@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — seven regressions and all local acceptance gates pass
 - **Finding:** Audit #13
 - **Priority:** P2
 - **Effort:** M
@@ -184,16 +184,29 @@ The two cache tests protect storage semantics and bounds; the five integration t
 
 ## Done criteria
 
-- [ ] All seven named regression tests are discovered and pass (two unit, five integration).
-- [ ] Uncached unchanged children reject the entire cache update; result-ID growth cannot cause mid-response reconstruction failure.
-- [ ] Workspace-only partials persist; malformed, errored, and cancelled results leave accepted cached state intact.
-- [ ] Three transient CLI calls reuse the same Owner and reconstruct full related reports, including partial-only input.
-- [ ] Third-call fixture assertions prove previous-result IDs survive export/import updates.
-- [ ] Cache-limit tests assert both snapshot count and serialized byte bounds; no evicted entry is revived by import.
-- [ ] Raw Query output and diagnostic `rawReport` evidence retain their original semantics.
-- [ ] Full test/build, lint, format, schema, stored-state, and whitespace gates exit 0.
-- [ ] Only scoped implementation/metadata files changed; temporary Owners cleaned up.
-- [ ] Plan and index status/evidence updated.
+- [x] All seven named regression tests are discovered and pass (two unit, five integration).
+- [x] Uncached unchanged children reject the entire cache update; result-ID growth cannot cause mid-response reconstruction failure.
+- [x] Workspace-only partials persist; malformed, errored, and cancelled results leave accepted cached state intact.
+- [x] Three transient CLI calls reuse the same Owner and reconstruct full related reports, including partial-only input.
+- [x] Third-call fixture assertions prove previous-result IDs survive export/import updates.
+- [x] Cache-limit tests assert both snapshot count and serialized byte bounds; no evicted entry is revived by import.
+- [x] Raw Query output and diagnostic `rawReport` evidence retain their original semantics.
+- [x] Full test/build, lint, format, schema, stored-state, and whitespace gates exit 0.
+- [x] Only scoped implementation/metadata files changed; temporary Owners cleaned up.
+- [x] Plan and index status/evidence updated.
+
+## Verification evidence (2026-09-08)
+
+- Starting HEAD: `e83786f` (merged PR #59), detached at `origin/main`, clean worktree. #40 is closed. Drift review covered the landed complete-chunk change plus explicit-server selection, bounded handshakes/writes, and synchronization delivery; those invariants remain intact. `ActiveQuery.partial_chunks` retains whole progress values, while `partial_result_items` alone supplies the existing flattened failure evidence. Baseline full suite passed **139** tests (`/tmp/49-baseline.log`).
+- Cache RED: both required unit tests failed on the original implementation: export/import reverted `main-two` to `main-one`, and an unresolved related report yielded non-null effective data instead of rejecting the update (`/tmp/49-cache-red.log`). An initial Rust sum type-inference typo was fixed before recording this intended RED.
+- CLI RED: final-only and partial-only related reports both passed the first full response and failed the second independent CLI invocation with `invalid_server_result` at the related URI; Workspace follow-up lacked the partial-only record's previous ID (`/tmp/49-cli-red.log`). A relative test `--file` argument was corrected before this evidence. Malformed coverage uses an invalid report shape (`items: 17`), not deeper Diagnostic validation outside this plan.
+- The Owner now merges complete chunks and validates cloned diagnostic values through the existing Query helpers only after successful post-response Document validation. It never rewrites final results or raw partial evidence. Cache reconstruction reads all prerequisites before any bounded store, so unresolved children reject the whole update and ID-growth eviction cannot interrupt current-response reconstruction. Pull cache payloads retain effective full content/latest IDs; import remains independent-record-only and published records are unchanged.
+- Caller audit: `dispatch_owner_query` imports independent Owner state before composing diagnostic requests (read-only `session.rs`); document/workspace envelopes retain their existing invalid-result checks and exact current raw metadata. Owner successful responses call the shared merger/validator for only the two diagnostic methods, and errored/cancelled/failed-validation paths do not update the pull cache. `apply_pull_report` remains the independent import path; document/workspace methods reconstruct all accepted reports before storing. `store`, result-ID invalidation, and byte accounting remain the existing bounded mechanism.
+- Discovery lists exactly **two** unit and **five** integration `related_diagnostics` tests. All seven pass, all six diagnostics unit tests pass, and `named_cardinality_and_invalid_results_are_normalized` passes. The five integration tests also passed three repeated runs (**15/15**). Fixtures assert actual latest previous IDs on the third process invocation, stable Owner generations, final/partial/Workspace reconstruction, malformed/unresolved/error/cancel rejection, and exact raw results/progress traces (`/tmp/49-cli-green.log`). Cancellation uses the existing partial-byte-limit/acknowledgement gate, not a sleep race.
+- Full suite passed **152** tests with concurrent plan 012 changes present (104 unit + 4 CLI + 3 documentation + 38 lifecycle + 3 installation; `/tmp/49-full-green.log`). Clippy with `-D warnings`, formatting, schema, stored-state, and `git diff --check` all exit **0**. Tests ran locally on Linux; native Windows/macOS and MSRV were not run locally.
+- Issue #49 changes are limited to its five allowed implementation files and this plan. Other worktree changes belong to the separately authorized plans 012/014; the root coordinator owns their shared index update and final combined review. No untracked files, dependency/schema changes, commit, push, or PR introduced by this task. Temporary fixtures stop only their own Owners, including panic cleanup.
+
+- Final coordinator verification after all three plans: **155** tests pass (107 unit + 4 CLI + 3 documentation + 38 lifecycle + 3 installation), exact regression discovery counts **6/2/5/3**, and Clippy, formatting, schema, stored-state, and whitespace gates pass. Logs: `/tmp/48-50-root-full-green.log`, `/tmp/48-50-root-clippy.log`. Independent coordinator review found no blocking findings; the shared index now marks plans 012–014 DONE. Changes remain uncommitted; native Windows/macOS/MSRV CI was not run.
 
 ## STOP conditions
 

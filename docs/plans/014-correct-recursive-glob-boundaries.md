@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — three regressions and all acceptance gates pass
 - **Audit finding:** 14
 - **Priority:** P2
 - **Effort:** S
@@ -126,12 +126,23 @@ Three narrowly scoped unit tests cover the algorithm and both independent consum
 
 ## Done criteria
 
-- [ ] Discovery assertion returns 0 with exactly three new `recursive_glob_*` tests.
-- [ ] `**/main.rs` does not match `/workspace/domain.rs`, while all listed component-boundary positives pass.
-- [ ] Document selector and file-operation consumer regressions pass.
-- [ ] Existing Query/Owner tests, full suite, Clippy, formatting, and diff hygiene all pass.
-- [ ] Production Owner runtime, schemas, dependencies, and unrelated glob semantics are untouched.
-- [ ] This plan and its index row record completion.
+- [x] Discovery assertion returns 0 with exactly three new `recursive_glob_*` tests.
+- [x] `**/main.rs` does not match `/workspace/domain.rs`, while all listed component-boundary positives pass.
+- [x] Document selector and file-operation consumer regressions pass.
+- [x] Existing Query/Owner tests, full suite, Clippy, formatting, and diff hygiene all pass.
+- [x] Production Owner runtime, schemas, dependencies, and unrelated glob semantics are untouched by this plan.
+- [x] This plan records completion; the coordinating reviewer owns the index update.
+
+## Verification evidence
+
+- Starting HEAD: `e83786f` (detached `origin/main`). Plans 012/013 were concurrently authorized uncommitted work and were preserved. Drift inspection against `5268c6a` found no Query matcher changes; Owner changes belong to landed lifecycle/synchronization plans and retain the same file-operation filter contract. Plan 013's concurrent changes only widen two unrelated Query helper visibilities and update diagnostic caching in the Owner.
+- Added exactly the three specified regressions. Discovery assertion exits **0** (`/tmp/50-discovery.log`). The initial focused run failed all three on the intended `domain.rs` admission: direct matcher returned true, Document composition admitted the suffix, and rename filtering admitted `domain.rs -> other.rs` (`/tmp/50-red.log`). No fixture or compilation failure was counted as RED.
+- The only production change for this plan gates the `**/` suffix attempt on the beginning of the path or a preceding `/`. Recursive consumption and the memoization key are unchanged. Table coverage preserves zero/multiple directories, ordinary `*`, bare `**`, braces/classes, and ASCII case handling. Consumer tests cover absolute/relative selectors, either rename endpoint, and create filters with resource-kind and case options.
+- Focused regressions: **3** pass (`/tmp/50-green.log`); Query tests: **18** pass (`/tmp/50-query.log`); Owner unit tests: **7** pass (`/tmp/50-owner.log`).
+- Full `cargo test --locked --all-targets --features fake-server`: **155** pass (107 unit + 4 CLI + 3 documentation + 38 lifecycle + 3 installation), including concurrent plans 012/013 (`/tmp/50-full-green.log`). Clippy with `-D warnings`, formatting, discovery assertion, and `git diff --check` all exit **0** (`/tmp/50-clippy.log`).
+- Scope inspection confirms this plan changes only the shared Query matcher, its two inline tests, the Owner test module, and this metadata. No dependencies, schemas, normalization, or new glob semantics were introduced. Verified locally on Linux Rust **1.98.1**; native macOS/Windows and Rust 1.89 were not run locally. Changes remain uncommitted for review.
+
+- Final coordinator verification after all three plans: **155** tests pass (107 unit + 4 CLI + 3 documentation + 38 lifecycle + 3 installation), exact regression discovery counts **6/2/5/3**, and Clippy, formatting, schema, stored-state, and whitespace gates pass. Logs: `/tmp/48-50-root-full-green.log`, `/tmp/48-50-root-clippy.log`. Independent coordinator review found no blocking findings; the shared index now marks plans 012–014 DONE. Changes remain uncommitted; native Windows/macOS/MSRV CI was not run.
 
 ## STOP conditions
 

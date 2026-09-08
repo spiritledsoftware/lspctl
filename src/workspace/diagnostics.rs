@@ -202,20 +202,22 @@ impl DiagnosticCache {
     }
 
     pub(crate) fn apply_pull_report(&mut self, uri: &str, report: Value) -> DiagnosticResult {
-        let kind = report.get("kind").and_then(Value::as_str);
-        if kind == Some("unchanged") {
-            self.clock = self.clock.saturating_add(1);
-            if let Some(snapshot) = self.snapshots.get_mut(&pull_key(uri)) {
-                snapshot.last_used = self.clock;
-                let result_id = report
+        let result = self.reconstruct_pull_report(uri, report);
+        self.store_pull_result(&result);
+        result
+    }
+
+    // Reconstruction reads only pre-update snapshots: storing one larger result must not
+    // evict content needed to resolve another unchanged report in the same response.
+    fn reconstruct_pull_report(&self, uri: &str, report: Value) -> DiagnosticResult {
+        if report.get("kind").and_then(Value::as_str) == Some("unchanged") {
+            if let Some(snapshot) = self.snapshots.get(&pull_key(uri)) {
+                let mut result = render(snapshot, true, true);
+                result.result_id = report
                     .get("resultId")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| snapshot.result_id.clone());
-                snapshot.result_id.clone_from(&result_id);
-                let mut result = render(snapshot, true, true);
-                result.raw_report = report.clone();
-                result.result_id = result_id;
+                    .or(result.result_id);
                 if let Some(result_id) = &result.result_id {
                     result.effective_report["resultId"] = Value::String(result_id.clone());
                 }
@@ -223,53 +225,59 @@ impl DiagnosticCache {
                 if let Some(version) = report.get("version") {
                     result.effective_report["version"] = version.clone();
                 }
+                result.raw_report = report;
                 return result;
             }
+        } else if report.get("kind").and_then(Value::as_str) == Some("full")
+            && report.get("items").is_some_and(Value::is_array)
+        {
             return DiagnosticResult {
                 uri: uri.to_owned(),
-                diagnostics: Value::Array(Vec::new()),
+                diagnostics: report["items"].clone(),
+                result_id: report
+                    .get("resultId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                effective_report: report.clone(),
                 raw_report: report,
-                effective_report: Value::Null,
-                result_id: None,
                 version: None,
-                fresh: false,
-                complete: false,
+                fresh: true,
+                complete: true,
                 closed: false,
             };
         }
-        let diagnostics = report
-            .get("items")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let result_id = report
-            .get("resultId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        DiagnosticResult {
+            uri: uri.to_owned(),
+            diagnostics: Value::Array(Vec::new()),
+            raw_report: report,
+            effective_report: Value::Null,
+            result_id: None,
+            version: None,
+            fresh: false,
+            complete: false,
+            closed: false,
+        }
+    }
+
+    fn store_pull_result(&mut self, result: &DiagnosticResult) {
+        if !result.complete {
+            return;
+        }
         self.store(
-            pull_key(uri),
+            pull_key(&result.uri),
             CachedDiagnostics {
-                uri: uri.to_owned(),
-                version: None,
-                diagnostics: diagnostics.clone(),
-                raw_report: report.clone(),
-                result_id: result_id.clone(),
+                uri: result.uri.clone(),
+                version: result.version,
+                diagnostics: result.diagnostics.clone(),
+                // Pull snapshots hold effective full content/current IDs, not current wire evidence.
+                raw_report: result.effective_report.clone(),
+                result_id: result.result_id.clone(),
                 received_for_version: None,
-                closed: false,
+                closed: result.closed,
                 serialized_bytes: 0,
                 last_used: 0,
             },
         );
-        DiagnosticResult {
-            uri: uri.to_owned(),
-            diagnostics,
-            effective_report: report.clone(),
-            raw_report: report,
-            result_id,
-            version: None,
-            fresh: true,
-            complete: true,
-            closed: false,
-        }
     }
 
     /// Reconstructs unchanged main and related Document diagnostic reports.
@@ -278,33 +286,38 @@ impl DiagnosticCache {
         uri: &str,
         report: Value,
     ) -> DiagnosticResult {
-        let raw_report = report.clone();
-        let related_reports = report
+        let related = report
             .get("relatedDocuments")
             .and_then(Value::as_object)
-            .cloned();
-        let mut result = self.apply_pull_report(uri, report);
-        let Some(related_reports) = related_reports else {
+            .map(|reports| {
+                reports
+                    .iter()
+                    .map(|(uri, report)| self.reconstruct_pull_report(uri, report.clone()))
+                    .collect::<Vec<_>>()
+            });
+        let mut result = self.reconstruct_pull_report(uri, report);
+        if !result.complete
+            || related
+                .as_ref()
+                .is_some_and(|reports| reports.iter().any(|r| !r.complete))
+        {
+            result.effective_report = Value::Null;
+            result.fresh = false;
+            result.complete = false;
             return result;
-        };
-        let mut effective_related = serde_json::Map::new();
-        for (related_uri, related_report) in related_reports {
-            let related = self.apply_pull_report(&related_uri, related_report.clone());
-            result.fresh &= related.fresh;
-            result.complete &= related.complete;
-            effective_related.insert(
-                related_uri,
-                if related.effective_report.is_null() {
-                    related_report
-                } else {
-                    related.effective_report
-                },
+        }
+        if let Some(related) = related {
+            result.effective_report["relatedDocuments"] = Value::Object(
+                related
+                    .iter()
+                    .map(|r| (r.uri.clone(), r.effective_report.clone()))
+                    .collect(),
             );
+            for related in related {
+                self.store_pull_result(&related);
+            }
         }
-        if !result.effective_report.is_null() {
-            result.effective_report["relatedDocuments"] = Value::Object(effective_related);
-        }
-        result.raw_report = raw_report;
+        self.store_pull_result(&result);
         result
     }
 
@@ -314,44 +327,47 @@ impl DiagnosticCache {
         &mut self,
         report: Value,
     ) -> WorkspaceDiagnosticResult {
-        let Some(items) = report.get("items").and_then(Value::as_array) else {
+        let reconstructed = report
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let uri = item.get("uri")?.as_str()?;
+                        let result = self.reconstruct_pull_report(uri, item.clone());
+                        result.complete.then_some(result)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+        let Some(reconstructed) = reconstructed else {
             return WorkspaceDiagnosticResult {
                 effective_report: report.clone(),
-                raw_report: Value::Null,
+                raw_report: report,
                 fresh: false,
                 complete: false,
                 workspace_complete: false,
             };
         };
-        let mut effective_items = Vec::with_capacity(items.len());
-        let mut fresh = true;
-        let mut complete = true;
-        let mut had_unchanged = false;
-        for item in items {
-            let Some(uri) = item.get("uri").and_then(Value::as_str) else {
-                effective_items.push(item.clone());
-                fresh = false;
-                complete = false;
-                continue;
-            };
-            had_unchanged |= item.get("kind").and_then(Value::as_str) == Some("unchanged");
-            let current = self.apply_pull_report(uri, item.clone());
-            fresh &= current.fresh;
-            complete &= current.complete;
-            if current.effective_report.is_null() {
-                effective_items.push(item.clone());
-            } else {
-                effective_items.push(current.effective_report);
-            }
-        }
+        let had_unchanged = reconstructed
+            .iter()
+            .any(|r| r.raw_report["kind"] == "unchanged");
         let mut effective_report = report.clone();
-        effective_report["items"] = Value::Array(effective_items);
+        effective_report["items"] = Value::Array(
+            reconstructed
+                .iter()
+                .map(|r| r.effective_report.clone())
+                .collect(),
+        );
+        for result in reconstructed {
+            self.store_pull_result(&result);
+        }
         WorkspaceDiagnosticResult {
             effective_report,
             raw_report: if had_unchanged { report } else { Value::Null },
-            fresh,
-            complete,
-            workspace_complete: complete,
+            fresh: true,
+            complete: true,
+            workspace_complete: true,
         }
     }
 
@@ -543,6 +559,131 @@ mod tests {
         assert_eq!(
             result.effective_report["relatedDocuments"]["file:///related"]["resultId"],
             "related-two"
+        );
+    }
+
+    #[test]
+    fn related_diagnostics_survive_cache_round_trip() {
+        let mut cache = DiagnosticCache::new(8, 8192);
+        cache.apply_document_pull_report(
+            "file:///main",
+            json!({
+                "kind":"full", "resultId":"main-one", "items":[{"message":"main"}],
+                "relatedDocuments":{"file:///related":{
+                    "kind":"full", "resultId":"related-one", "items":[{"message":"related"}]
+                }}
+            }),
+        );
+        let mut imported = DiagnosticCache::new(8, 8192);
+        imported.import_state(&cache.export_state());
+        let raw = json!({"kind":"unchanged", "resultId":"main-two",
+            "relatedDocuments":{"file:///related":{"kind":"unchanged", "resultId":"related-two"}}
+        });
+        let current = imported.apply_document_pull_report("file:///main", raw.clone());
+        assert!(current.complete);
+        assert_eq!(current.raw_report, raw);
+        let mut third = DiagnosticCache::new(8, 8192);
+        third.import_state(&imported.export_state());
+        for (uri, id, message) in [
+            ("file:///main", "main-two", "main"),
+            ("file:///related", "related-two", "related"),
+        ] {
+            assert_eq!(third.pull_result_id(uri), Some(id));
+            let snapshot = &third.snapshots[&pull_key(uri)];
+            assert_eq!(snapshot.raw_report["kind"], "full");
+            assert_eq!(snapshot.raw_report["resultId"], id);
+            assert_eq!(snapshot.raw_report["items"], json!([{"message":message}]));
+        }
+        assert_eq!(
+            third.snapshots[&pull_key("file:///main")].raw_report["relatedDocuments"]["file:///related"]
+                ["kind"],
+            "full"
+        );
+    }
+
+    #[test]
+    fn related_diagnostics_respect_cache_limits() {
+        let seed = json!({"kind":"full", "resultId":"main-one", "items":[],
+            "relatedDocuments":{"file:///related":{
+                "kind":"full", "resultId":"related-one", "items":[{"message":"retained"}]
+            }}
+        });
+        let mut cache = DiagnosticCache::new(8, 8192);
+        cache.apply_document_pull_report("file:///main", seed.clone());
+        let before = cache.export_state();
+        let rejected = cache.apply_document_pull_report(
+            "file:///main",
+            json!({
+                "kind":"full", "resultId":"rejected", "items":[],
+                "relatedDocuments":{
+                    "file:///related":{"kind":"full", "resultId":"also-rejected", "items":[]},
+                    "file:///unknown":{"kind":"unchanged", "resultId":"missing"}
+                }
+            }),
+        );
+        assert!(!rejected.complete);
+        assert!(rejected.effective_report.is_null());
+        assert_eq!(cache.export_state(), before);
+        let rejected_workspace = cache.apply_workspace_pull_report(json!({"items":[
+            {"uri":"file:///related", "version":null, "kind":"full", "resultId":"bad", "items":[]},
+            {"uri":"file:///unknown", "version":null, "kind":"unchanged", "resultId":"missing"}
+        ]}));
+        assert!(!rejected_workspace.complete);
+        assert_eq!(cache.export_state(), before);
+
+        // Both records fit initially; growing IDs forces eviction during storage.
+        cache.max_total_bytes = cache.total_bytes + 32;
+        let grown_id = "n".repeat(200);
+        let updated = cache.apply_document_pull_report(
+            "file:///main",
+            json!({
+                "kind":"unchanged", "resultId":grown_id,
+                "relatedDocuments":{"file:///related":{"kind":"unchanged", "resultId":grown_id}}
+            }),
+        );
+        assert!(updated.complete);
+        assert_eq!(
+            updated.effective_report["relatedDocuments"]["file:///related"]["items"],
+            json!([{"message":"retained"}])
+        );
+        assert!(cache.total_bytes <= cache.max_total_bytes);
+        assert!(cache.snapshots.len() < 2);
+        assert_eq!(
+            cache.total_bytes,
+            cache
+                .snapshots
+                .values()
+                .map(|s| s.serialized_bytes)
+                .sum::<u64>()
+        );
+
+        let mut bounded = DiagnosticCache::new(1, 8192);
+        assert!(
+            bounded
+                .apply_document_pull_report("file:///main", seed)
+                .complete
+        );
+        assert_eq!(bounded.snapshots.len(), 1);
+        let state = bounded.export_state();
+        assert_eq!(state[0]["uri"], "file:///main");
+        assert_eq!(
+            state[0]["rawReport"]["relatedDocuments"]["file:///related"]["kind"],
+            "full"
+        );
+        let mut imported = DiagnosticCache::new(8, 8192);
+        imported.import_state(&state);
+        assert_eq!(imported.snapshots.len(), 1);
+        assert!(imported.pull_result_id("file:///related").is_none());
+        imported.invalidate_pull_result_ids();
+        assert!(imported.pull_result_ids().is_empty());
+        assert_eq!(imported.total_bytes, 0);
+        assert!(
+            !imported
+                .apply_pull_report(
+                    "file:///main",
+                    json!({"kind":"unchanged", "resultId":"lost"})
+                )
+                .complete
         );
     }
 

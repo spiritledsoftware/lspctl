@@ -2036,6 +2036,276 @@ impl Drop for StopOwnerOnPanic<'_> {
     }
 }
 
+fn related_diagnostic_documents(fixture: &Fixture) -> (String, String) {
+    for name in ["main.rs", "related.rs"] {
+        fs::write(fixture.workspace.join(name), "fn example() {}\n").unwrap();
+    }
+    let uri = |name| {
+        url::Url::from_file_path(dunce::canonicalize(fixture.workspace.join(name)).unwrap())
+            .unwrap()
+            .to_string()
+    };
+    (uri("main.rs"), uri("related.rs"))
+}
+
+fn related_diagnostic_query(fixture: &Fixture, workspace: bool) -> Value {
+    let path = fixture.workspace.join("main.rs");
+    let mut arguments = vec![
+        if workspace {
+            "workspace-diagnostics"
+        } else {
+            "document-diagnostics"
+        },
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--server",
+        "fake",
+        "--request-timeout",
+        "5s",
+    ];
+    if !workspace {
+        arguments.extend(["--file", path.to_str().unwrap()]);
+    }
+    fixture.command(&arguments)
+}
+
+fn related_diagnostic_mode(fixture: &Fixture, mode: &str) {
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--server",
+        "fake",
+        "--method",
+        "test/related-diagnostics-mode",
+        "--params-json",
+        &json!({"mode":mode}).to_string(),
+        "--request-timeout",
+        "5s",
+    ]);
+}
+
+fn related_diagnostic_full(name: &str, revision: usize) -> Value {
+    json!({
+        "kind":"full", "resultId":format!("{name}-{revision}"),
+        "items":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}, "message":name}]
+    })
+}
+
+fn assert_related_diagnostic_response(response: &Value, related: &str, revision: usize) {
+    let mut expected = related_diagnostic_full("main", revision);
+    expected["relatedDocuments"] = json!({(related):related_diagnostic_full("related", revision)});
+    if revision > 1 {
+        // Existing unchanged reconstruction includes each cached report's URI.
+        expected["uri"] = json!(
+            url::Url::parse(related)
+                .unwrap()
+                .join("main.rs")
+                .unwrap()
+                .as_str()
+        );
+        expected["relatedDocuments"][related]["uri"] = json!(related);
+    }
+    assert_eq!(response["result"], expected);
+    assert!(response["context"]["ownerGeneration"].is_string());
+    assert_eq!(response["diagnostics"]["complete"], true);
+    if revision > 1 {
+        assert_eq!(
+            response["diagnostics"]["rawReport"],
+            json!({
+                "kind":"unchanged", "resultId":format!("main-{revision}"),
+                "relatedDocuments":{(related):{"kind":"unchanged", "resultId":format!("related-{revision}")}}
+            })
+        );
+    }
+}
+
+#[test]
+fn related_diagnostics_survive_cli_invocations() {
+    let fixture = Fixture::with_server_arguments(&["--related-diagnostics=final"]);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let (_, related) = related_diagnostic_documents(&fixture);
+    let first = related_diagnostic_query(&fixture, false);
+    assert_related_diagnostic_response(&first, &related, 1);
+    for revision in 2..=3 {
+        let response = related_diagnostic_query(&fixture, false);
+        assert_related_diagnostic_response(&response, &related, revision);
+        assert_eq!(
+            response["context"]["ownerGeneration"],
+            first["context"]["ownerGeneration"]
+        );
+    }
+    fixture.stop(fixture.workspace.to_str().unwrap());
+}
+
+#[test]
+fn related_diagnostics_from_partial_chunks_survive_cli_invocations() {
+    let fixture = Fixture::with_server_arguments(&["--related-diagnostics=partial"]);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let (_, related) = related_diagnostic_documents(&fixture);
+    let first = related_diagnostic_query(&fixture, false);
+    assert_related_diagnostic_response(&first, &related, 1);
+    for revision in 2..=3 {
+        let response = related_diagnostic_query(&fixture, false);
+        assert_related_diagnostic_response(&response, &related, revision);
+        assert_eq!(
+            response["context"]["ownerGeneration"],
+            first["context"]["ownerGeneration"]
+        );
+    }
+    fixture.stop(fixture.workspace.to_str().unwrap());
+}
+
+#[test]
+fn related_diagnostics_workspace_partials_persist() {
+    let fixture = Fixture::with_server_arguments(&["--related-diagnostics=workspace"]);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let (main, related) = related_diagnostic_documents(&fixture);
+    let mut generation = Value::Null;
+    for revision in 1..=3 {
+        let response = related_diagnostic_query(&fixture, true);
+        let items = response["result"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for (name, uri) in [("main", &main), ("related", &related)] {
+            let mut expected = related_diagnostic_full(name, revision);
+            expected["uri"] = json!(uri);
+            expected["version"] = Value::Null;
+            assert!(items.contains(&expected), "{response}");
+        }
+        assert_eq!(response["diagnostics"]["complete"], true);
+        if revision == 1 {
+            generation = response["context"]["ownerGeneration"].clone();
+        } else {
+            assert_eq!(response["context"]["ownerGeneration"], generation);
+            assert!(
+                response["diagnostics"]["rawReport"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["kind"] == "unchanged")
+            );
+        }
+    }
+    fixture.stop(fixture.workspace.to_str().unwrap());
+}
+
+#[test]
+fn related_diagnostics_rejected_queries_preserve_cache() {
+    for (mode, code) in [
+        ("malformed", "invalid_server_result"),
+        ("unresolved", "invalid_server_result"),
+        ("error", "server_error"),
+        ("cancel", "partial_result_too_large"),
+    ] {
+        let fixture = Fixture::with_configuration(
+            &["--related-diagnostics=final"],
+            if mode == "cancel" {
+                "[protocol]\nmax_partial_result_bytes = 64\n"
+            } else {
+                ""
+            },
+        );
+        let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+        let (_, related) = related_diagnostic_documents(&fixture);
+        let first = related_diagnostic_query(&fixture, false);
+        assert_related_diagnostic_response(&first, &related, 1);
+        related_diagnostic_mode(&fixture, mode);
+        let output = fixture.output(&[
+            "document-diagnostics",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--server",
+            "fake",
+            "--file",
+            fixture.workspace.join("main.rs").to_str().unwrap(),
+            "--trace-protocol",
+            "--request-timeout",
+            "5s",
+        ]);
+        assert!(!output.status.success(), "{mode}");
+        assert!(output.stderr.is_empty());
+        let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(failure["error"]["code"], code, "{mode}: {failure}");
+        if matches!(mode, "error" | "cancel") {
+            assert_eq!(failure["partialResult"]["complete"], false);
+            assert_eq!(
+                failure["partialResult"]["items"][0]["relatedDocuments"][&related]["items"][0]["message"],
+                "poison"
+            );
+        }
+        if mode == "cancel" {
+            assert!(
+                failure["trace"]["frames"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["message"]["error"]["code"] == -32800)
+            );
+        }
+        related_diagnostic_mode(&fixture, "final");
+        let response = related_diagnostic_query(&fixture, false);
+        assert_related_diagnostic_response(&response, &related, 2);
+        assert_eq!(
+            response["context"]["ownerGeneration"],
+            first["context"]["ownerGeneration"]
+        );
+        fixture.stop(fixture.workspace.to_str().unwrap());
+    }
+}
+
+#[test]
+fn related_diagnostics_raw_queries_keep_exact_results() {
+    for mode in ["final", "partial"] {
+        let fixture = Fixture::with_server_arguments(&["--related-diagnostics=final"]);
+        let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+        let (main, related) = related_diagnostic_documents(&fixture);
+        let first = related_diagnostic_query(&fixture, false);
+        related_diagnostic_mode(&fixture, mode);
+        let raw = |revision| {
+            fixture.command(&[
+            "raw", "--workspace", fixture.workspace.to_str().unwrap(), "--server", "fake",
+            "--method", "textDocument/diagnostic", "--params-json",
+            &json!({"textDocument":{"uri":main}, "previousResultId":format!("main-{revision}"), "partialResultToken":"raw-related-progress"}).to_string(),
+            "--trace-protocol", "--request-timeout", "5s",
+        ])
+        };
+        let response = raw(1);
+        let mut expected = json!({"kind":"unchanged", "resultId":"main-2"});
+        if mode == "final" {
+            expected["relatedDocuments"] =
+                json!({(related.clone()):{"kind":"unchanged", "resultId":"related-2"}});
+        }
+        assert_eq!(response["result"], expected);
+        assert!(response.get("diagnostics").is_none());
+        let frames = response["trace"]["frames"].as_array().unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["message"]["result"] == expected)
+        );
+        if mode == "partial" {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["message"]["method"] == "$/progress"
+                        && frame["message"]["params"]["token"] == "raw-related-progress"
+                        && frame["message"]["params"]["value"]["relatedDocuments"][&related]["kind"]
+                            == "unchanged")
+            );
+        }
+        related_diagnostic_mode(&fixture, "raw-malformed");
+        assert_eq!(raw(2)["result"], json!(17));
+        related_diagnostic_mode(&fixture, "final");
+        let response = related_diagnostic_query(&fixture, false);
+        assert_related_diagnostic_response(&response, &related, 3);
+        assert_eq!(
+            response["context"]["ownerGeneration"],
+            first["context"]["ownerGeneration"]
+        );
+        fixture.stop(fixture.workspace.to_str().unwrap());
+    }
+}
+
 #[test]
 fn owner_partial_results_chunks_merge_success() {
     let fixture = Fixture::new();

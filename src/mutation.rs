@@ -1014,48 +1014,48 @@ fn refresh_preview_presentation(
     };
     stored.preview.stale_reasons = preview_manifest_mismatches(&stored.preview.plan, &current);
     stored.preview.diff = if stored.preview.stale_reasons.is_empty() {
-        preview_diff(stored)
+        preview_diff(stored, mutation_settings)
     } else {
         None
     };
 }
 
-fn preview_diff(stored: &StoredPreview) -> Option<String> {
+fn preview_diff(stored: &StoredPreview, limits: &MutationSettings) -> Option<String> {
     let mut output = String::new();
-    for operation in &stored.preview.plan.operations {
-        match operation {
-            CanonicalOperation::Text { path, edits, .. } => {
-                let bytes = fs::read(path).ok()?;
-                let old = std::str::from_utf8(&bytes).ok()?;
-                let mut new = String::new();
-                let mut cursor = 0;
-                for edit in edits {
-                    let start = usize::try_from(edit.start_byte).ok()?;
-                    let end = usize::try_from(edit.end_byte).ok()?;
-                    new.push_str(old.get(cursor..start)?);
-                    new.push_str(&edit.new_text);
-                    cursor = end;
+    application::visit_canonical_text_outputs(
+        &stored.preview.preview_id,
+        &stored.preview.plan.operations,
+        limits,
+        |operation, text| {
+            match operation {
+                CanonicalOperation::Text { path, .. } => {
+                    let (before, after) = text.unwrap();
+                    let decode = |bytes| {
+                        std::str::from_utf8(bytes)
+                            .map_err(|_| invalid_workspace_edit(&stored.preview.edit, Vec::new()))
+                    };
+                    output.push_str(&contextual_text_diff(path, decode(before)?, decode(after)?));
                 }
-                new.push_str(old.get(cursor..)?);
-                output.push_str(&contextual_text_diff(path, old, &new));
+                CanonicalOperation::Create { path, .. } => {
+                    output.push_str(&format!("create {}\n", path.display()));
+                }
+                CanonicalOperation::Rename {
+                    old_path, new_path, ..
+                } => {
+                    output.push_str(&format!(
+                        "rename {} -> {}\n",
+                        old_path.display(),
+                        new_path.display()
+                    ));
+                }
+                CanonicalOperation::Delete { path, .. } => {
+                    output.push_str(&format!("delete {}\n", path.display()));
+                }
             }
-            CanonicalOperation::Create { path, .. } => {
-                output.push_str(&format!("create {}\n", path.display()));
-            }
-            CanonicalOperation::Rename {
-                old_path, new_path, ..
-            } => {
-                output.push_str(&format!(
-                    "rename {} -> {}\n",
-                    old_path.display(),
-                    new_path.display()
-                ));
-            }
-            CanonicalOperation::Delete { path, .. } => {
-                output.push_str(&format!("delete {}\n", path.display()));
-            }
-        }
-    }
+            Ok(())
+        },
+    )
+    .ok()?;
     Some(output)
 }
 
@@ -1269,5 +1269,263 @@ pub(crate) fn create_preview_record(
         stale_reasons: Vec::new(),
         diff: None,
         reserved: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    pub(super) fn text_change(path: &Path, start: u32, end: u32, text: &str) -> Value {
+        json!({"textDocument": {"uri": url::Url::from_file_path(path).unwrap(), "version": null},
+            "edits": [{"range": {"start": {"line": 0, "character": start},
+                "end": {"line": 0, "character": end}}, "newText": text}]})
+    }
+
+    pub(super) fn stored_preview(workspace: &Path, edit: Value) -> StoredPreview {
+        let (previews, _, mutation) = default_mutation_settings();
+        let planner =
+            WorkspaceEditPlanner::open(workspace, PositionEncoding::Utf16, &previews, &mutation)
+                .unwrap();
+        let planned = planner.plan_workspace_edit(&edit).unwrap();
+        let workspace_uri = url::Url::from_directory_path(workspace)
+            .unwrap()
+            .to_string();
+        StoredPreview {
+            format_version: state::MUTATION_STATE_VERSION,
+            created_unix_seconds: 0,
+            expires_unix_seconds: i64::MAX,
+            workspace_path: workspace.to_path_buf(),
+            authorization_digest: String::new(),
+            recovery_manifest_digest: None,
+            preview: create_preview_record(
+                PreviewRecordContext {
+                    preview_id: "prv_00000000000000000000000000000000",
+                    workspace_uri: &workspace_uri,
+                    server: None,
+                    session_identity: "test",
+                    position_encoding: "utf-16",
+                    source: json!({}),
+                    edit,
+                    command: None,
+                },
+                planned,
+            ),
+        }
+    }
+
+    #[test]
+    fn ordered_preview_create_then_edit() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("created.rs");
+        let stored = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [
+                {"kind": "create", "uri": url::Url::from_file_path(&file).unwrap()},
+                text_change(&file, 0, 0, "é🦀\r\n")
+            ]}),
+        );
+        let diff = preview_diff(&stored, &default_mutation_settings().2)
+            .expect("create then edit must render");
+        assert_eq!(
+            diff,
+            format!(
+                "create {}\n{}",
+                file.display(),
+                contextual_text_diff(&file, "", "é🦀\r\n")
+            )
+        );
+        assert!(diff.contains("+é🦀\r\n"), "{diff:?}");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn ordered_preview_repeated_text_edits() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("repeated.rs");
+        fs::write(&file, "é\r\n").unwrap();
+        let stored = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [
+                text_change(&file, 1, 1, "🦀long"), text_change(&file, 3, 7, "new")
+            ]}),
+        );
+        let diff = preview_diff(&stored, &default_mutation_settings().2)
+            .expect("repeated edits must render intermediate text");
+        assert_eq!(
+            diff,
+            format!(
+                "{}{}",
+                contextual_text_diff(&file, "é\r\n", "é🦀long\r\n"),
+                contextual_text_diff(&file, "é🦀long\r\n", "é🦀new\r\n")
+            )
+        );
+        for line in ["-é\r\n", "+é🦀long\r\n", "-é🦀long\r\n", "+é🦀new\r\n"] {
+            assert!(diff.contains(line), "missing {line:?}: {diff:?}");
+        }
+        assert_eq!(fs::read(&file).unwrap(), "é\r\n".as_bytes());
+    }
+
+    #[test]
+    fn ordered_preview_preserves_stale_and_noop_behavior() {
+        use crate::canonical_value::digest_raw_bytes;
+
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("text.rs");
+        let original = "é🦀old\r\n";
+        fs::write(&file, original).unwrap();
+        let (previews, _, limits) = default_mutation_settings();
+        let stored = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [text_change(&file, 3, 6, "new")]}),
+        );
+        let noop = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [text_change(&file, 3, 6, "old")]}),
+        );
+        assert!(noop.preview.plan.operations.is_empty());
+        assert_eq!(preview_diff(&noop, &limits), Some(String::new()));
+        for invalid in [
+            "before_digest",
+            "after_digest",
+            "reverse",
+            "outside",
+            "overflow",
+            "overlap",
+            "utf8_boundary",
+        ] {
+            let mut malformed = stored.clone();
+            let CanonicalOperation::Text {
+                before_digest,
+                after_digest,
+                edits,
+                ..
+            } = &mut malformed.preview.plan.operations[0]
+            else {
+                unreachable!()
+            };
+            match invalid {
+                "before_digest" => *before_digest = digest_raw_bytes(b"different"),
+                "after_digest" => *after_digest = digest_raw_bytes(b"different"),
+                "reverse" => {
+                    edits[0].start_byte = 8;
+                    edits[0].end_byte = 2;
+                }
+                "outside" => edits[0].end_byte = 100,
+                "overflow" => {
+                    edits[0].start_byte = u64::MAX;
+                    edits[0].end_byte = u64::MAX;
+                }
+                "overlap" => edits.push(edits[0].clone()),
+                "utf8_boundary" => {
+                    edits[0].start_byte = 1;
+                    edits[0].end_byte = 2;
+                    *after_digest = digest_raw_bytes(
+                        &[&original.as_bytes()[..1], b"new", &original.as_bytes()[2..]].concat(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let mut emitted = 0;
+            assert!(
+                application::visit_canonical_text_outputs(
+                    "test",
+                    &malformed.preview.plan.operations,
+                    &limits,
+                    |_, _| {
+                        emitted += 1;
+                        Ok(())
+                    }
+                )
+                .is_err(),
+                "{invalid}"
+            );
+            assert_eq!(emitted, 0, "{invalid}");
+            assert!(preview_diff(&malformed, &limits).is_none(), "{invalid}");
+            assert_eq!(fs::read(&file).unwrap(), original.as_bytes());
+        }
+        let mut stale = stored.clone();
+        fs::write(&file, "external edit\n").unwrap();
+        assert!(
+            preview_diff(&stale, &limits).is_none(),
+            "digest guards an intervening edit even without preflight"
+        );
+        refresh_preview_presentation(&mut stale, &previews, &limits);
+        assert!(stale.preview.diff.is_none());
+        assert!(!stale.preview.stale_reasons.is_empty());
+        assert_eq!(
+            serde_json::to_value(&stale.preview.plan).unwrap(),
+            serde_json::to_value(&stored.preview.plan).unwrap()
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"external edit\n");
+        fs::remove_file(&file).unwrap();
+        assert!(preview_diff(&stored, &limits).is_none());
+        refresh_preview_presentation(&mut stale, &previews, &limits);
+        assert!(stale.preview.diff.is_none());
+        assert!(!file.exists());
+
+        // Resource-only operations must not decode binary files or materialize their destinations.
+        let binary = workspace.path().join("binary");
+        let moved = workspace.path().join("moved");
+        let created = workspace.path().join("created");
+        fs::write(&binary, [0xff, 0, 0xfe]).unwrap();
+        let uri = |path: &Path| url::Url::from_file_path(path).unwrap();
+        let resources = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [
+                {"kind": "rename", "oldUri": uri(&binary), "newUri": uri(&moved)},
+                {"kind": "delete", "uri": uri(&moved)},
+                {"kind": "create", "uri": uri(&created)}
+            ]}),
+        );
+        let mut zero = limits.clone();
+        zero.max_staged_text_bytes = 0;
+        assert_eq!(
+            preview_diff(&resources, &zero),
+            Some(format!(
+                "rename {} -> {}\ndelete {}\ncreate {}\n",
+                binary.display(),
+                moved.display(),
+                moved.display(),
+                created.display()
+            ))
+        );
+        assert_eq!(fs::read(&binary).unwrap(), [0xff, 0, 0xfe]);
+        assert!(!moved.exists());
+        assert!(!created.exists());
+        assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ordered_preview_rename_then_edit() {
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source.rs");
+        let target = workspace.path().join("target.rs");
+        fs::write(&source, "é🦀old\r\n").unwrap();
+        let stored = stored_preview(
+            workspace.path(),
+            json!({"documentChanges": [
+                {"kind": "rename", "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&target).unwrap()},
+                text_change(&target, 3, 6, "new")
+            ]}),
+        );
+        let diff = preview_diff(&stored, &default_mutation_settings().2)
+            .expect("rename then edit must render");
+        assert_eq!(
+            diff,
+            format!(
+                "rename {} -> {}\n{}",
+                source.display(),
+                target.display(),
+                contextual_text_diff(&target, "é🦀old\r\n", "é🦀new\r\n")
+            )
+        );
+        assert!(diff.contains("-é🦀old\r\n"));
+        assert!(diff.contains("+é🦀new\r\n"));
+        assert_eq!(fs::read(&source).unwrap(), "é🦀old\r\n".as_bytes());
+        assert!(!target.exists());
     }
 }
