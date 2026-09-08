@@ -45,9 +45,15 @@ memory and handles, zero queue depth after quiescence, Document/diagnostic LRU
 churn, and graceful stop within five seconds.
 
 `tests/fixtures/stored-state/v1` is the immutable first-release compatibility
-seed. Every future stable release must add fixtures and candidate migration
-coverage for all earlier releases in the same major version. The JSON digest
-checker and Rust deserialization tests prevent accidental format drift.
+seed. `tests/fixtures/stored-state/v0.1.1` explicitly covers v0.1.1 with the
+same payloads: the stored types did not change, and both deserialization tests
+were run against the immutable v0.1.1 tag before copying its fixtures. The
+candidate checks both seeds and exercises legacy recursive-Preview rejection
+and legacy Recovery ownership restrictions in the Mutation tests.
+
+Every future stable release must add fixtures and candidate migration coverage
+for all earlier releases in the same major version. The JSON digest checker
+and Rust deserialization tests prevent accidental format drift.
 
 `release-gates.json` is the authoritative machine-readable list. Candidate
 workflows fail if any gate is pending; gates are never represented by empty or

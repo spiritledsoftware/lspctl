@@ -40,7 +40,7 @@
     {
       "name": "stored-state-compatibility",
       "state": "implemented",
-      "reason": "The immutable 0.1.0 first-release seed covers Trust, Denial, Preview, Receipt, and Recovery records; digest and Rust deserialization checks run in CI."
+      "reason": "Immutable 0.1.0 and 0.1.1 seeds cover Trust, Denial, Preview, Receipt, and Recovery records; digest, Rust deserialization, and legacy Preview/Recovery safety checks run in CI."
     },
     {
       "name": "performance-and-soak",

@@ -12,7 +12,7 @@ fn local_install_is_managed_idempotent_and_replace_requires_consent() {
     assert_eq!(installed["command"], json!(["skill", "install"]));
     assert_eq!(installed["result"]["scope"], "local");
     assert_eq!(installed["result"]["outcome"], "installed");
-    assert_eq!(installed["result"]["skillVersion"], "0.1.1");
+    assert_eq!(installed["result"]["skillVersion"], "0.1.2");
     assert_eq!(installed["result"]["previousDigest"], Value::Null);
     let destination = workspace.path().join(".agent/skills/lspctl");
     let marker: Value =

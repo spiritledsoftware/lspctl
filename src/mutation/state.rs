@@ -1145,23 +1145,27 @@ mod tests {
     }
 
     #[test]
-    fn first_release_stored_state_fixtures_remain_readable() {
-        let preview: StoredPreview = serde_json::from_str(include_str!(
-            "../../tests/fixtures/stored-state/v1/preview.json"
-        ))
-        .unwrap();
-        let receipt: StoredReceipt = serde_json::from_str(include_str!(
-            "../../tests/fixtures/stored-state/v1/receipt.json"
-        ))
-        .unwrap();
-        let recovery: TransactionRecord = serde_json::from_str(include_str!(
-            "../../tests/fixtures/stored-state/v1/recovery.json"
-        ))
-        .unwrap();
+    fn same_major_stored_state_fixtures_remain_readable() {
+        for (preview, receipt, recovery) in [
+            (
+                include_str!("../../tests/fixtures/stored-state/v1/preview.json"),
+                include_str!("../../tests/fixtures/stored-state/v1/receipt.json"),
+                include_str!("../../tests/fixtures/stored-state/v1/recovery.json"),
+            ),
+            (
+                include_str!("../../tests/fixtures/stored-state/v0.1.1/preview.json"),
+                include_str!("../../tests/fixtures/stored-state/v0.1.1/receipt.json"),
+                include_str!("../../tests/fixtures/stored-state/v0.1.1/recovery.json"),
+            ),
+        ] {
+            let preview: StoredPreview = serde_json::from_str(preview).unwrap();
+            let receipt: StoredReceipt = serde_json::from_str(receipt).unwrap();
+            let recovery: TransactionRecord = serde_json::from_str(recovery).unwrap();
 
-        assert_eq!(preview.format_version, MUTATION_STATE_VERSION);
-        assert_eq!(receipt.format_version, MUTATION_STATE_VERSION);
-        assert_eq!(recovery.format_version, MUTATION_STATE_VERSION);
+            assert_eq!(preview.format_version, MUTATION_STATE_VERSION);
+            assert_eq!(receipt.format_version, MUTATION_STATE_VERSION);
+            assert_eq!(recovery.format_version, MUTATION_STATE_VERSION);
+        }
     }
 
     #[test]
