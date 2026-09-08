@@ -30,7 +30,9 @@ use super::{
         CAPABILITY_PROFILE_VERSION, NegotiatedCapabilities, fixed_initialize_capabilities,
         normalize_initialize_result,
     },
-    json_rpc_transport::{JsonRpcFrame, JsonRpcFrameReader, JsonRpcFrameWriter},
+    json_rpc_transport::{
+        JsonRpcFrame, JsonRpcFrameReader, JsonRpcFrameWriter, JsonRpcTransportError,
+    },
     owner_protocol::{
         AuthenticatedOwnerRequest, OWNER_PROTOCOL_VERSION, OWNER_QUEUE_LIMIT, OwnerDocumentInput,
         OwnerEndpoint, OwnerLaunchSettings, OwnerRequest, OwnerResponse,
@@ -141,6 +143,7 @@ struct LspRuntime {
     reader_quiescence: Option<mpsc::Sender<ReaderQuiescenceRequest>>,
     reader_task: Option<JoinHandle<()>>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
+    fatal_transport_failure: Option<Value>,
     stderr: mpsc::Receiver<String>,
     stderr_task: Option<JoinHandle<()>>,
     stderr_closed: bool,
@@ -290,7 +293,8 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 ).await {
                     should_stop = true;
                 }
-                if let Some(status) = lsp.process.try_wait()? {
+                if lsp.fatal_transport_failure.is_none()
+                    && let Some(status) = lsp.process.try_wait()? {
                     lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
                     lsp.finish_server_stderr().await;
                     let failure = server_exited_failure(Some(status), &lsp.server_stderr_tail());
@@ -387,7 +391,8 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
                     }
                     OwnerRequest::Diagnostics { documents } => {
-                        let response = match lsp.synchronize_documents(&documents).await {
+                        let deadline = TokioInstant::now() + lsp.shutdown_timeout;
+                        let response = match lsp.synchronize_documents(&documents, deadline).await {
                             Ok(()) => {
                                 let versions = documents.iter().filter_map(|document| {
                                     let uri = Url::from_file_path(&document.path).ok()?.to_string();
@@ -405,10 +410,14 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             ),
                         };
                         let _ = pending.response.send(response);
+                        if !lsp.writer.is_reusable() {
+                            wait_for_owner_response_flush(pending.delivered).await;
+                        }
                     }
                     OwnerRequest::RefreshDocuments { file_operations } => {
+                        let deadline = TokioInstant::now() + lsp.shutdown_timeout;
                         let file_operations_delivered = lsp
-                            .send_file_operation_notifications(&file_operations)
+                            .send_file_operation_notifications(&file_operations, deadline)
                             .await
                             .is_ok();
                         let (outcomes, failures) = lsp.documents.refresh_open_documents(
@@ -420,13 +429,13 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             if !outcome.events.is_empty() {
                                 changed.push(outcome.snapshot.uri.clone());
                             }
-                            if lsp.send_synchronization_events(outcome.events).await.is_err() {
+                            if lsp.send_synchronization_events(outcome.events, deadline).await.is_err() {
                                 delivery_failed = true;
                             }
                         }
                         let pending_events = lsp.documents.drain_pending_events();
                         if lsp
-                            .send_synchronization_events(pending_events)
+                            .send_synchronization_events(pending_events, deadline)
                             .await
                             .is_err()
                         {
@@ -438,6 +447,9 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             "delivered": file_operations_delivered && !delivery_failed && failures.is_empty()
                         });
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
+                        if !lsp.writer.is_reusable() {
+                            wait_for_owner_response_flush(pending.delivered).await;
+                        }
                     }
                     OwnerRequest::Stop { force } => {
                         unreachable!("stop requests use the Owner control queue: force={force}");
@@ -471,16 +483,18 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
             frame = lsp.frames.as_mut().expect("ready Owners have an LSP reader pump").recv() => {
                 match frame {
                     Some(Ok(Some(frame))) => {
+                        let deadline = active_write_deadline(&active_queries, TokioInstant::now() + lsp.shutdown_timeout);
                         if let Err(error) = lsp.handle_concurrent_frame(
                             &bootstrap.owner_generation,
                             frame,
                             &mut active_queries,
+                            deadline,
                         ).await {
                             lsp.log.push("protocol_violation", "error", &error);
                             fail_active_queries(
                                 &bootstrap.owner_generation,
                                 &mut active_queries,
-                                protocol_failure(error),
+                                lsp.fatal_transport_failure.clone().unwrap_or_else(|| protocol_failure(error)),
                             ).await;
                             lsp.process.terminate_process_tree(Duration::ZERO).await;
                             should_stop = true;
@@ -517,15 +531,16 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
             }
             _ = std::future::ready(()), if lsp.has_pending_server_requests() => {
+                let deadline = active_write_deadline(&active_queries, TokioInstant::now() + lsp.shutdown_timeout);
                 let result = lsp
-                    .process_next_server_request(&mut active_queries, true)
+                    .process_next_server_request(&mut active_queries, true, deadline)
                     .await;
                 if let Err(error) = result {
                     lsp.log.push("protocol_violation", "error", &error);
                     fail_active_queries(
                         &bootstrap.owner_generation,
                         &mut active_queries,
-                        protocol_failure(error),
+                        lsp.fatal_transport_failure.clone().unwrap_or_else(|| protocol_failure(error)),
                     ).await;
                     lsp.process.terminate_process_tree(Duration::ZERO).await;
                     should_stop = true;
@@ -543,6 +558,42 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         + Duration::from_millis(settings.idle_timeout_ms);
                 }
             }
+        }
+        // The failure survives best-effort callers and is checked before any further dispatch.
+        if !lsp.writer.is_reusable() {
+            draining.store(true, Ordering::Release);
+            listener_task.abort();
+            let failure = lsp.fatal_transport_failure.clone().unwrap_or_else(|| {
+                transport_failure(&io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "An LSP frame write was abandoned",
+                ))
+            });
+            lsp.process.terminate_process_tree(Duration::ZERO).await;
+            fail_active_queries(
+                &bootstrap.owner_generation,
+                &mut active_queries,
+                failure.clone(),
+            )
+            .await;
+            fail_queued_requests(
+                &bootstrap.owner_generation,
+                &mut requests_rx,
+                failure.clone(),
+            )
+            .await;
+            fail_queued_requests(
+                &bootstrap.owner_generation,
+                &mut controls_rx,
+                failure.clone(),
+            )
+            .await;
+            if let Some(pending) = pending_stop.take() {
+                let _ = pending
+                    .response
+                    .send(OwnerResponse::failure(&bootstrap.owner_generation, failure));
+            }
+            should_stop = true;
         }
     }
 
@@ -619,6 +670,7 @@ impl LspRuntime {
             reader_quiescence: None,
             reader_task: None,
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
+            fatal_transport_failure: None,
             stderr: stderr_rx,
             stderr_task: Some(stderr_task),
             stderr_closed: false,
@@ -745,6 +797,7 @@ impl LspRuntime {
         initialization_options: Option<Value>,
         timeout: Duration,
     ) -> io::Result<()> {
+        let deadline = TokioInstant::now() + timeout;
         let request = json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -759,8 +812,7 @@ impl LspRuntime {
                 "workDoneToken": "lspctl-initialize-1"
             }
         });
-        self.write_lsp_message(&request, true).await?;
-        let deadline = TokioInstant::now() + timeout;
+        self.write_lsp_message(&request, true, deadline).await?;
         let initialize_result = loop {
             tokio::select! {
                 _ = tokio_time::sleep_until(deadline) => {
@@ -789,7 +841,7 @@ impl LspRuntime {
                             io::Error::new(io::ErrorKind::InvalidData, "Initialize response omitted result")
                         })?;
                     }
-                    self.handle_initialization_message(frame.message).await?;
+                    self.handle_initialization_message(frame.message, deadline).await?;
                 }
             }
         };
@@ -798,11 +850,16 @@ impl LspRuntime {
         self.write_lsp_message(
             &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
             true,
+            deadline,
         )
         .await
     }
 
-    async fn handle_initialization_message(&mut self, message: Value) -> io::Result<()> {
+    async fn handle_initialization_message(
+        &mut self,
+        message: Value,
+        deadline: TokioInstant,
+    ) -> io::Result<()> {
         if let (Some(id), Some(method)) = (message.get("id").cloned(), message["method"].as_str()) {
             let response = if method == "window/showMessageRequest" {
                 json!({"jsonrpc": "2.0", "id": id, "result": null})
@@ -817,7 +874,7 @@ impl LspRuntime {
                     }
                 })
             };
-            return self.write_lsp_message(&response, true).await;
+            return self.write_lsp_message(&response, true, deadline).await;
         }
         self.handle_notification(&message, None);
         Ok(())
@@ -840,6 +897,7 @@ impl LspRuntime {
         cancelled: watch::Receiver<bool>,
         active: &mut BTreeMap<i64, ActiveQuery>,
     ) {
+        let deadline = TokioInstant::now() + timeout;
         if active.len() >= OWNER_QUEUE_LIMIT {
             let _ = response.send(OwnerResponse::failure(
                 owner_generation,
@@ -857,13 +915,21 @@ impl LspRuntime {
         }
         let mut refresh_failures = Vec::new();
         if refresh_open_documents {
-            refresh_failures = self.refresh_open_documents_best_effort().await;
+            refresh_failures = self.refresh_open_documents_best_effort(deadline).await;
         }
-        if let Err(failure) = self.synchronize_documents(&documents).await {
+        if let Some(failure) = &self.fatal_transport_failure {
+            let _ = response.send(OwnerResponse::failure(owner_generation, failure.clone()));
+            wait_for_owner_response_flush(delivered).await;
+            return;
+        }
+        if let Err(failure) = self.synchronize_documents(&documents, deadline).await {
             let _ = response.send(OwnerResponse::failure(
                 owner_generation,
                 contract_failure_value(failure),
             ));
+            if !self.writer.is_reusable() {
+                wait_for_owner_response_flush(delivered).await;
+            }
             return;
         }
         let validated_documents = if refresh_open_documents {
@@ -887,13 +953,15 @@ impl LspRuntime {
         let partial_token = request.pointer("/params/partialResultToken").cloned();
         let mut trace = trace_protocol.then(|| self.startup_trace.take().unwrap_or_default());
         if let Err(error) = self
-            .write_lsp_message_traced(&request, trace.as_mut())
+            .write_lsp_message_traced(&request, trace.as_mut(), deadline)
             .await
         {
-            let _ = response.send(OwnerResponse::failure(
-                owner_generation,
-                transport_failure(error),
-            ));
+            let mut failure = transport_failure(&error);
+            attach_trace(&mut failure, trace);
+            let _ = response.send(OwnerResponse::failure(owner_generation, failure));
+            if !self.writer.is_reusable() {
+                wait_for_owner_response_flush(delivered).await;
+            }
             return;
         }
         active.insert(
@@ -905,7 +973,7 @@ impl LspRuntime {
                 response: Some(response),
                 delivered: Some(delivered),
                 cancelled,
-                deadline: TokioInstant::now() + timeout,
+                deadline,
                 timeout,
                 cancellation: None,
                 partial_token,
@@ -927,6 +995,7 @@ impl LspRuntime {
         owner_generation: &str,
         frame: JsonRpcFrame,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
         for query in active.values_mut() {
             if let Some(trace) = &mut query.trace {
@@ -964,6 +1033,7 @@ impl LspRuntime {
                         &query.validated_documents,
                         &result,
                         query.raw_request,
+                        deadline,
                     )
                     .await
                 {
@@ -1005,7 +1075,7 @@ impl LspRuntime {
         }
 
         if message.get("id").is_some() && message.get("method").is_some() {
-            return self.queue_server_request(message, active).await;
+            return self.queue_server_request(message, active, deadline).await;
         }
 
         if message.get("method").is_some() && message.get("id").is_none() {
@@ -1055,14 +1125,19 @@ impl LspRuntime {
                             "method": "$/cancelRequest",
                             "params": {"id": id}
                         });
-                        self.write_lsp_message(&cancel, false)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        self.write_lsp_message(
+                            &cancel,
+                            false,
+                            query.cancellation.as_ref().unwrap().deadline,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
                     }
                 }
             }
             if method == "$/cancelRequest" {
-                self.cancel_server_request(&message, active).await?;
+                self.cancel_server_request(&message, active, deadline)
+                    .await?;
             } else if !matched_partial {
                 self.handle_notification(&message, None);
             }
@@ -1075,6 +1150,7 @@ impl LspRuntime {
         &mut self,
         message: Value,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let Some(key) = ServerRequestId::from_value(&id) else {
@@ -1084,7 +1160,9 @@ impl LspRuntime {
                 "Invalid server request identifier",
                 None,
             );
-            return self.write_server_response(&response, active).await;
+            return self
+                .write_server_response(&response, active, deadline)
+                .await;
         };
         if self.server_requests.contains_key(&key) || self.processing_server_requests.contains(&key)
         {
@@ -1099,7 +1177,9 @@ impl LspRuntime {
                 "Client busy",
                 Some(json!({"reason": "client_busy", "limit": SERVER_REQUEST_LIMIT})),
             );
-            return self.write_server_response(&response, active).await;
+            return self
+                .write_server_response(&response, active, deadline)
+                .await;
         }
         self.server_request_order.push_back(key.clone());
         self.server_requests
@@ -1115,6 +1195,7 @@ impl LspRuntime {
         &mut self,
         active: &mut BTreeMap<i64, ActiveQuery>,
         drain_frames: bool,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
         let Some(key) = self.server_request_order.pop_front() else {
             return Ok(());
@@ -1126,13 +1207,13 @@ impl LspRuntime {
         };
         self.processing_server_requests.insert(key.clone());
         let response = if pending.message["method"] == "workspace/applyEdit" {
-            self.handle_apply_edit_callback(&pending.message, active)
+            self.handle_apply_edit_callback(&pending.message, active, deadline)
                 .await
         } else {
             self.route_server_request(pending.message).await
         };
         let reader_resume = if drain_frames {
-            Some(self.drain_reader_frames(active).await?)
+            Some(self.drain_reader_frames(active, deadline).await?)
         } else {
             None
         };
@@ -1141,9 +1222,10 @@ impl LspRuntime {
                 .send(())
                 .map_err(|_| "The LSP reader pump stopped before resuming".to_owned())?;
         }
-        self.write_server_response(&response, active).await?;
+        self.write_server_response(&response, active, deadline)
+            .await?;
         let reader_resume = if drain_frames {
-            Some(self.drain_reader_frames(active).await?)
+            Some(self.drain_reader_frames(active, deadline).await?)
         } else {
             None
         };
@@ -1159,6 +1241,7 @@ impl LspRuntime {
     async fn drain_reader_frames(
         &mut self,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<oneshot::Sender<()>, String> {
         let quiescence_sender = self
             .reader_quiescence
@@ -1186,7 +1269,7 @@ impl LspRuntime {
                         if drained > SERVER_REQUEST_LIMIT {
                             return Err("The server emitted too many frames while a request was being processed".to_owned());
                         }
-                        self.handle_drained_reader_frame(frame, active).await?;
+                        self.handle_drained_reader_frame(frame, active, deadline).await?;
                     }
                     return Ok(resume);
                 }
@@ -1196,7 +1279,7 @@ impl LspRuntime {
                     if drained > SERVER_REQUEST_LIMIT {
                         return Err("The server emitted too many frames while a request was being processed".to_owned());
                     }
-                    self.handle_drained_reader_frame(frame, active).await?;
+                    self.handle_drained_reader_frame(frame, active, deadline).await?;
                 }
             }
         }
@@ -1206,12 +1289,13 @@ impl LspRuntime {
         &mut self,
         frame: Result<Option<JsonRpcFrame>, String>,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
         let frame = frame?.ok_or_else(|| {
             "The language server exited while its frames were being drained".to_owned()
         })?;
         let owner_generation = self.owner_generation.clone();
-        self.handle_concurrent_frame(&owner_generation, frame, active)
+        self.handle_concurrent_frame(&owner_generation, frame, active, deadline)
             .await
     }
 
@@ -1219,6 +1303,7 @@ impl LspRuntime {
         &mut self,
         message: &Value,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
         let Some(id) = message.pointer("/params/id") else {
             return Ok(());
@@ -1240,17 +1325,20 @@ impl LspRuntime {
             "Request cancelled",
             None,
         );
-        self.write_server_response(&response, active).await
+        self.write_server_response(&response, active, deadline)
+            .await
     }
 
     async fn write_server_response(
         &mut self,
         response: &Value,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Result<(), String> {
+        // Drained progress can start cancellation while a callback is being processed.
+        let deadline = active_write_deadline(active, deadline);
         let (header, body) = self
-            .writer
-            .write_json_rpc_frame_with_bytes(response)
+            .write_lsp_frame(response, deadline)
             .await
             .map_err(|error| error.to_string())?;
         for query in active.values_mut() {
@@ -1265,6 +1353,7 @@ impl LspRuntime {
         &mut self,
         message: &Value,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        deadline: TokioInstant,
     ) -> Value {
         let callback_id = message.get("id").cloned().unwrap_or(Value::Null);
         let candidate = (active.len() == 1)
@@ -1396,7 +1485,7 @@ impl LspRuntime {
         let mut synchronize = |operations: &[Value]| {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(self.synchronize_documents_after_commit(operations))
+                    .block_on(self.synchronize_documents_after_commit(operations, deadline))
             })
         };
         match crate::mutation::apply_preauthorized_workspace_edit(
@@ -1483,9 +1572,13 @@ impl LspRuntime {
         }
     }
 
-    async fn synchronize_documents_after_commit(&mut self, file_operations: &[Value]) -> bool {
+    async fn synchronize_documents_after_commit(
+        &mut self,
+        file_operations: &[Value],
+        deadline: TokioInstant,
+    ) -> bool {
         let file_operations_delivered = self
-            .send_file_operation_notifications(file_operations)
+            .send_file_operation_notifications(file_operations, deadline)
             .await
             .is_ok();
         let (outcomes, failures) = self
@@ -1494,7 +1587,7 @@ impl LspRuntime {
         let mut synchronized = failures.is_empty();
         for outcome in outcomes {
             synchronized &= self
-                .send_synchronization_events(outcome.events)
+                .send_synchronization_events(outcome.events, deadline)
                 .await
                 .is_ok();
         }
@@ -1502,7 +1595,7 @@ impl LspRuntime {
         file_operations_delivered
             && synchronized
             && self
-                .send_synchronization_events(pending_events)
+                .send_synchronization_events(pending_events, deadline)
                 .await
                 .is_ok()
     }
@@ -1553,12 +1646,16 @@ impl LspRuntime {
                         "params": {"id": id}
                     }),
                     false,
+                    active[&id].cancellation.as_ref().unwrap().deadline,
                 )
                 .await
                 .is_err()
             {
                 cancellation_grace_expired = true;
             }
+        }
+        if self.fatal_transport_failure.is_some() {
+            return true;
         }
         if cancellation_grace_expired {
             self.process.terminate_process_tree(Duration::ZERO).await;
@@ -1577,6 +1674,7 @@ impl LspRuntime {
     async fn synchronize_documents(
         &mut self,
         documents: &[OwnerDocumentInput],
+        deadline: TokioInstant,
     ) -> Result<(), ContractFailure> {
         for document in documents {
             let outcome = self.documents.refresh(
@@ -1600,22 +1698,32 @@ impl LspRuntime {
                     }),
                 });
             }
-            self.send_synchronization_events(outcome.events).await?;
+            self.send_synchronization_events(outcome.events, deadline)
+                .await?;
         }
         Ok(())
     }
 
-    async fn refresh_open_documents_best_effort(&mut self) -> Vec<ContractFailure> {
+    async fn refresh_open_documents_best_effort(
+        &mut self,
+        deadline: TokioInstant,
+    ) -> Vec<ContractFailure> {
         let (outcomes, failures) = self
             .documents
             .refresh_open_documents(self.negotiated.text_synchronization);
         for outcome in outcomes {
-            if let Err(failure) = self.send_synchronization_events(outcome.events).await {
+            if let Err(failure) = self
+                .send_synchronization_events(outcome.events, deadline)
+                .await
+            {
                 return vec![failure];
             }
         }
         let pending_events = self.documents.drain_pending_events();
-        if let Err(failure) = self.send_synchronization_events(pending_events).await {
+        if let Err(failure) = self
+            .send_synchronization_events(pending_events, deadline)
+            .await
+        {
             return vec![failure];
         }
         failures
@@ -1691,6 +1799,7 @@ impl LspRuntime {
         documents: &[OwnerDocumentInput],
         server_result: &Value,
         raw_request: bool,
+        deadline: TokioInstant,
     ) -> Result<Vec<Value>, ContractFailure> {
         let mut changed = Vec::new();
         for document in documents {
@@ -1700,7 +1809,8 @@ impl LspRuntime {
                 self.negotiated.text_synchronization,
             )?;
             if outcome.snapshot.digest != document.expected_digest {
-                self.send_synchronization_events(outcome.events).await?;
+                self.send_synchronization_events(outcome.events, deadline)
+                    .await?;
                 if raw_request {
                     changed.push(json!({
                         "uri": outcome.snapshot.uri,
@@ -1734,6 +1844,7 @@ impl LspRuntime {
     async fn send_synchronization_events(
         &mut self,
         events: Vec<SynchronizationEvent>,
+        deadline: TokioInstant,
     ) -> Result<(), ContractFailure> {
         for event in events {
             let notification = match event {
@@ -1756,7 +1867,7 @@ impl LspRuntime {
                     })
                 }
             };
-            self.write_lsp_message(&notification, false)
+            self.write_lsp_message(&notification, false, deadline)
                 .await
                 .map_err(|error| ContractFailure {
                     exit_code: 4,
@@ -1775,6 +1886,7 @@ impl LspRuntime {
     async fn send_file_operation_notifications(
         &mut self,
         operations: &[Value],
+        deadline: TokioInstant,
     ) -> Result<(), ContractFailure> {
         for operation in operations {
             let Some(kind) = operation.get("kind").and_then(Value::as_str) else {
@@ -1812,6 +1924,7 @@ impl LspRuntime {
                     "params": {"files": files}
                 }),
                 false,
+                deadline,
             )
             .await
             .map_err(|error| ContractFailure {
@@ -1974,6 +2087,11 @@ impl LspRuntime {
     }
 
     async fn graceful_shutdown(&mut self) {
+        let deadline = TokioInstant::now() + self.shutdown_timeout;
+        if !self.writer.is_reusable() {
+            self.process.terminate_process_tree(Duration::ZERO).await;
+            return;
+        }
         if self.process.try_wait().ok().flatten().is_some() {
             return;
         }
@@ -1986,7 +2104,10 @@ impl LspRuntime {
             self.documents
                 .close_all(self.negotiated.text_synchronization),
         );
-        if let Err(failure) = self.send_synchronization_events(close_events).await {
+        if let Err(failure) = self
+            .send_synchronization_events(close_events, deadline)
+            .await
+        {
             self.log.push(
                 "lifecycle",
                 "warning",
@@ -1997,17 +2118,20 @@ impl LspRuntime {
             );
         }
 
+        if !self.writer.is_reusable() {
+            return;
+        }
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         if self
             .write_lsp_message(
                 &json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}),
                 false,
+                deadline,
             )
             .await
             .is_ok()
         {
-            let deadline = TokioInstant::now() + self.shutdown_timeout;
             let mut no_active_queries = BTreeMap::new();
             loop {
                 tokio::select! {
@@ -2024,12 +2148,12 @@ impl LspRuntime {
                             Some(Ok(Some(frame))) => {
                                 let message = frame.message;
                                 if message.get("id").is_some() && message.get("method").is_some() {
-                                    if self.queue_server_request(message, &mut no_active_queries).await.is_err() {
+                                    if self.queue_server_request(message, &mut no_active_queries, deadline).await.is_err() {
                                         break;
                                     }
                                 } else if message.get("method").is_some() && message.get("id").is_none() {
                                     if message["method"] == "$/cancelRequest" {
-                                        if self.cancel_server_request(&message, &mut no_active_queries).await.is_err() {
+                                        if self.cancel_server_request(&message, &mut no_active_queries, deadline).await.is_err() {
                                             break;
                                         }
                                     } else {
@@ -2044,7 +2168,7 @@ impl LspRuntime {
                     }
                     _ = std::future::ready(()), if self.has_pending_server_requests() => {
                         if self
-                            .process_next_server_request(&mut no_active_queries, false)
+                            .process_next_server_request(&mut no_active_queries, false, deadline)
                             .await
                             .is_err()
                         {
@@ -2053,24 +2177,54 @@ impl LspRuntime {
                     }
                 }
             }
-            let _ = self
-                .write_lsp_message(&json!({"jsonrpc": "2.0", "method": "exit"}), false)
-                .await;
+            if self.writer.is_reusable() {
+                let _ = self
+                    .write_lsp_message(
+                        &json!({"jsonrpc": "2.0", "method": "exit"}),
+                        false,
+                        deadline,
+                    )
+                    .await;
+            }
         }
-        if tokio_time::timeout(self.shutdown_timeout, self.process.wait())
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio_time::timeout_at(deadline, self.process.wait()).await,
+            Ok(Ok(_))
+        ) {
             self.process.terminate_process_tree(Duration::ZERO).await;
         }
     }
 
-    async fn write_lsp_message(&mut self, message: &Value, startup: bool) -> io::Result<()> {
-        let bytes = self
+    async fn write_lsp_frame(
+        &mut self,
+        message: &Value,
+        deadline: TokioInstant,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let result = self
             .writer
-            .write_json_rpc_frame_with_bytes(message)
+            .write_json_rpc_frame_with_bytes(message, deadline)
             .await
-            .map_err(io::Error::other)?;
+            .map_err(|error| match error {
+                JsonRpcTransportError::WriteFrame(source) => source,
+                error => io::Error::other(error),
+            });
+        if !self.writer.is_reusable() {
+            if let Err(error) = &result {
+                self.fatal_transport_failure
+                    .get_or_insert_with(|| transport_failure(error));
+            }
+            self.process.terminate_process_tree(Duration::ZERO).await;
+        }
+        result
+    }
+
+    async fn write_lsp_message(
+        &mut self,
+        message: &Value,
+        startup: bool,
+        deadline: TokioInstant,
+    ) -> io::Result<()> {
+        let bytes = self.write_lsp_frame(message, deadline).await?;
         if startup && let Some(trace) = &mut self.startup_trace {
             trace.push("client_to_server", &bytes.0, &bytes.1, message);
         }
@@ -2081,17 +2235,30 @@ impl LspRuntime {
         &mut self,
         message: &Value,
         trace: Option<&mut ProtocolTrace>,
+        deadline: TokioInstant,
     ) -> io::Result<()> {
-        let (header, body) = self
-            .writer
-            .write_json_rpc_frame_with_bytes(message)
-            .await
-            .map_err(io::Error::other)?;
+        let (header, body) = self.write_lsp_frame(message, deadline).await?;
         if let Some(trace) = trace {
             trace.push("client_to_server", &header, &body, message);
         }
         Ok(())
     }
+}
+
+fn active_write_deadline(
+    active: &BTreeMap<i64, ActiveQuery>,
+    fallback: TokioInstant,
+) -> TokioInstant {
+    active
+        .values()
+        .map(|query| {
+            query
+                .cancellation
+                .as_ref()
+                .map_or(query.deadline, |cancellation| cancellation.deadline)
+        })
+        .min()
+        .unwrap_or(fallback)
 }
 
 fn file_operation_registered(
@@ -2841,7 +3008,7 @@ fn append_bounded_stderr_tail(tail: &mut String, chunk: &str) {
     tail.drain(..start);
 }
 
-fn transport_failure(error: io::Error) -> Value {
+fn transport_failure(error: &io::Error) -> Value {
     json!({
         "category": "query", "code": "transport_failed", "message": "The language-server transport failed.",
         "stage": "await_response", "delivery": "uncertain", "retry": "unsafe",

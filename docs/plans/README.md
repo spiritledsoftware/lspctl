@@ -21,7 +21,7 @@ Effort: **S** hours, **M** roughly a day, **L** multiple days, including tests. 
 | 7 | [007](007-enforce-raw-document-scope.md) | Enforce explicit server selection for external raw Documents | P1 | S | LOW | — | DONE — 120 tests; fmt/Clippy/schema/diff passed |
 | 8 | [008](008-bound-owner-handshakes.md) | Bound unauthenticated Owner admission and handshakes | P1 | S | LOW | — | DONE — 124 tests; fmt/Clippy/schema/stored-state/diff passed |
 | 9 | [009](009-decouple-trust-administration.md) | Decouple Trust administration from unrelated executable availability | P1 | M | MED | — | DONE — bounded fix; 129 tests/gates passed; independent named-status success deferred |
-| 10 | [011](011-bound-language-server-writes.md) | Bound language-server writes and make incomplete delivery fatal | P1 | M | MED | 005 | TODO |
+| 10 | [011](011-bound-language-server-writes.md) | Bound language-server writes and make incomplete delivery fatal | P1 | M | MED | 005 | DONE — 3 transport/4 lifecycle regressions; 136 tests and all gates passed |
 | 11 | [010](010-deliver-document-synchronization-transitions.md) | Deliver committed Document synchronization transitions | P1 | M | MED | 011 | TODO |
 | 12 | [012](012-render-ordered-preview-diffs.md) | Render Preview diffs against ordered virtual filesystem state | P2 | M | MED | — | TODO |
 | 13 | [013](013-persist-related-diagnostic-reports.md) | Persist related diagnostic reports across CLI calls | P2 | M | MED | 004 | TODO |

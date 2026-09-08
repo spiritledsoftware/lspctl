@@ -2,6 +2,8 @@
 
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
@@ -1030,6 +1032,513 @@ fn owner_maintenance_times_out_under_notifications() {
 #[test]
 fn owner_maintenance_cancels_disconnected_caller_under_notifications() {
     check_maintenance_under_notifications(true);
+}
+
+struct WriteCaller {
+    child: KillChildOnDrop,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl WriteCaller {
+    fn spawn(fixture: &Fixture, name: &str, arguments: &[&str]) -> Self {
+        let stdout = fixture._root.path().join(format!("{name}.json"));
+        let stderr = fixture._root.path().join(format!("{name}.stderr"));
+        Self {
+            child: KillChildOnDrop(
+                Command::new(env!("CARGO_BIN_EXE_lspctl"))
+                    .args(arguments)
+                    .current_dir(&fixture.workspace)
+                    .envs(fixture.environment.iter().cloned())
+                    .stdout(fs::File::create(&stdout).unwrap())
+                    .stderr(fs::File::create(&stderr).unwrap())
+                    .spawn()
+                    .unwrap(),
+            ),
+            stdout,
+            stderr,
+        }
+    }
+
+    fn finish(&mut self, deadline: Instant) -> Value {
+        wait_for_child(&mut self.child.0, deadline);
+        assert!(fs::read(&self.stderr).unwrap().is_empty());
+        let bytes = fs::read(&self.stdout).unwrap();
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "invalid CLI response: {error}: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+}
+
+// CLI Queries first enqueue a Capabilities request. Use an authenticated, generation-bound
+// Dispatch for the follower so its admission cannot be mistaken for that preflight.
+struct WriteDispatch {
+    stream: TcpStream,
+    endpoint: Value,
+}
+
+impl WriteDispatch {
+    fn connect(fixture: &Fixture, deadline: Instant) -> Self {
+        fn endpoint_in(directory: &std::path::Path) -> Option<Value> {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if let Some(endpoint) = endpoint_in(&path) {
+                        return Some(endpoint);
+                    }
+                } else if directory.ends_with("endpoints")
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                {
+                    return Some(serde_json::from_slice(&fs::read(path).unwrap()).unwrap());
+                }
+            }
+            None
+        }
+        let endpoint = endpoint_in(fixture._root.path()).expect("fixture Owner endpoint");
+        let address = endpoint["address"].as_str().unwrap().parse().unwrap();
+        let stream = TcpStream::connect_timeout(
+            &address,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .unwrap();
+        Self { stream, endpoint }
+    }
+
+    fn send(&mut self, method: &str, params: Value, timeout_ms: u64, deadline: Instant) {
+        let request = json!({
+            "ownerProtocolVersion": self.endpoint["ownerProtocolVersion"],
+            "sessionIdentity": self.endpoint["sessionIdentity"],
+            "ownerGeneration": self.endpoint["ownerGeneration"],
+            "token": self.endpoint["token"],
+            "request": {
+                "kind": "dispatch", "method": method, "params": params,
+                "refresh_open_documents": false,
+                "raw_request": true, "request_timeout_ms": timeout_ms,
+                "trace_protocol": false, "apply_edits": false
+            }
+        });
+        let body = serde_json::to_vec(&request).unwrap();
+        self.stream
+            .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        self.stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .unwrap();
+        self.stream.write_all(&body).unwrap();
+    }
+
+    fn finish(&mut self, deadline: Instant) -> Value {
+        self.stream
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let mut length = [0; 4];
+        self.stream
+            .read_exact(&mut length)
+            .expect("admitted Dispatch must receive its old-generation failure, not EOF");
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(length < 1024 * 1024, "unexpected fixture response size");
+        let mut body = vec![0; length];
+        self.stream.read_exact(&mut body).unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response["ownerGeneration"],
+            self.endpoint["ownerGeneration"]
+        );
+        response
+    }
+}
+
+struct ReleaseWriteGateOnDrop(PathBuf);
+
+impl Drop for ReleaseWriteGateOnDrop {
+    fn drop(&mut self) {
+        // Unblock the old runtime even on RED, before bounded force-stop cleanup runs.
+        let _ = fs::write(self.0.with_extension("start"), "release");
+        let _ = fs::write(self.0.with_extension("dispatch"), "release");
+        let _ = fs::write(self.0.with_extension("resume"), "release");
+    }
+}
+
+fn wait_for_write_marker(marker: &std::path::Path, deadline: Instant) {
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture readiness exceeded watchdog"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn assert_write_server_alive(marker: &std::path::Path) {
+    let lifetime = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(marker.with_extension("lock"))
+        .unwrap();
+    assert!(
+        matches!(lifetime.try_lock(), Err(fs::TryLockError::WouldBlock)),
+        "fixture exited instead of retaining its unread/broken input"
+    );
+}
+
+fn wait_for_write_retirement(fixture: &Fixture, marker: &std::path::Path, deadline: Instant) {
+    let lifetime = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(marker.with_extension("lock"))
+        .unwrap();
+    loop {
+        match lifetime.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "unusable transport did not terminate server"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("cannot check server lifetime: {error}"),
+        }
+    }
+    loop {
+        let sessions = WriteCaller::spawn(
+            fixture,
+            "list",
+            &[
+                "session",
+                "list",
+                "--workspace",
+                fixture.workspace.to_str().unwrap(),
+            ],
+        )
+        .finish(deadline);
+        if sessions["result"] == json!([]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retired Owner generation remained discoverable"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn wait_for_write_queue(
+    fixture: &Fixture,
+    gate_method: &str,
+    count: u64,
+    deadline: Instant,
+) -> Value {
+    loop {
+        let status = WriteCaller::spawn(
+            fixture,
+            "status",
+            &[
+                "session",
+                "status",
+                "--workspace",
+                fixture.workspace.to_str().unwrap(),
+                "--server",
+                "fake",
+            ],
+        )
+        .finish(deadline);
+        if status["result"]["activeQuery"]["method"] == gate_method
+            && status["result"]["queueDepth"]
+                .as_u64()
+                .is_some_and(|depth| depth >= count)
+        {
+            return status["result"]["ownerGeneration"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "followers were not admitted to the old Owner queue: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn check_owner_write_failure(synchronize: bool, break_input: bool) {
+    const PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+    let root = TempDir::new().unwrap();
+    let events = root.path().join("events.log");
+    let event_argument = format!("--event-log={}", events.display());
+    // The payload and serialized didOpen both fit the explicitly configured limits.
+    let fixture = Fixture::with_configuration(
+        &[&event_argument],
+        "[protocol]\nmax_message_bytes = 16777216\n[synchronization]\nmax_document_bytes = 16777216\n[session]\nshutdown_timeout = '200ms'\n",
+    );
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let marker = fixture.workspace.join("write-ready");
+    let _release = ReleaseWriteGateOnDrop(marker.clone());
+    let params_file = fixture.workspace.join("params.json");
+    fs::write(
+        &params_file,
+        serde_json::to_vec(&json!({"payload": "x".repeat(PAYLOAD_BYTES)})).unwrap(),
+    )
+    .unwrap();
+    let document = fixture.workspace.join("large.rs");
+    fs::write(&document, "x".repeat(PAYLOAD_BYTES)).unwrap();
+    assert!(fs::metadata(&params_file).unwrap().len() < 16 * 1024 * 1024);
+    let workspace = fixture.workspace.to_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let gate_marker = if break_input {
+        marker.clone()
+    } else {
+        fixture.workspace.join("preflight-ready")
+    };
+    let _release_preflight = ReleaseWriteGateOnDrop(gate_marker.clone());
+    let mut gate = WriteCaller::spawn(
+        &fixture,
+        "gate",
+        &[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "test/write-gate",
+            "--params-json",
+            &json!({"marker": gate_marker, "breakInput": break_input}).to_string(),
+        ],
+    );
+    wait_for_write_marker(&gate_marker, deadline);
+    assert_write_server_alive(&gate_marker);
+    let mut arguments = vec![
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/write-stall",
+        "--request-timeout",
+        "200ms",
+    ];
+    if synchronize {
+        arguments.extend(["--sync-file", document.to_str().unwrap()]);
+    } else if !break_input {
+        arguments.extend(["--params-file", params_file.to_str().unwrap()]);
+    }
+    let mut direct = break_input.then(|| {
+        let mut request = WriteDispatch::connect(&fixture, deadline);
+        request.send("fixture/write-stall", Value::Null, 200, deadline);
+        request
+    });
+    let mut blocked = (!break_input).then(|| WriteCaller::spawn(&fixture, "blocked", &arguments));
+    let generation = wait_for_write_queue(&fixture, "test/write-gate", 1, deadline);
+    let mut dispatch_gate = None;
+    if !break_input {
+        // Capabilities is ahead of this second gate. Once it is answered, the gate
+        // holds dispatch while the real CLI prepares its large request/Document.
+        let mut second = WriteDispatch::connect(&fixture, deadline);
+        second.send(
+            "test/write-dispatch-gate",
+            json!({"marker": marker}),
+            30_000,
+            deadline,
+        );
+        wait_for_write_queue(&fixture, "test/write-gate", 2, deadline);
+        for extension in ["resume", "dispatch", "start"] {
+            fs::write(gate_marker.with_extension(extension), "release").unwrap();
+        }
+        wait_for_write_marker(&marker, deadline);
+        assert_write_server_alive(&marker);
+        // The CLI's preflight has completed: this entry is its actual Dispatch.
+        wait_for_write_queue(&fixture, "test/write-dispatch-gate", 1, deadline);
+        dispatch_gate = Some(second);
+    }
+    let mut queued = WriteDispatch::connect(&fixture, deadline);
+    queued.send(
+        "fixture/never-after-failed-write",
+        Value::Null,
+        200,
+        deadline,
+    );
+    wait_for_write_queue(
+        &fixture,
+        if break_input {
+            "test/write-gate"
+        } else {
+            "test/write-dispatch-gate"
+        },
+        2,
+        deadline,
+    );
+    fs::write(marker.with_extension("start"), "release").unwrap();
+    wait_for_write_marker(&marker.with_extension("stalled"), deadline);
+    assert_write_server_alive(&marker);
+    fs::write(marker.with_extension("dispatch"), "release").unwrap();
+    assert_eq!(gate.finish(deadline)["ok"], true);
+    if let Some(second) = dispatch_gate.as_mut() {
+        assert_eq!(second.finish(deadline)["ok"], true);
+    }
+    let failure = if let Some(blocked) = blocked.as_mut() {
+        blocked.finish(deadline)
+    } else {
+        direct.as_mut().unwrap().finish(deadline)
+    };
+    assert_eq!(failure["ok"], false, "{failure}");
+    assert_eq!(failure["error"]["delivery"], "uncertain", "{failure}");
+    assert_eq!(failure["error"]["retry"], "unsafe", "{failure}");
+    assert_eq!(
+        failure["error"]["code"],
+        if synchronize {
+            "owner_unavailable"
+        } else {
+            "transport_failed"
+        },
+        "{failure}"
+    );
+    if break_input {
+        assert!(
+            failure["error"]["data"]["osCode"].is_i64(),
+            "expected an immediate OS pipe error, not a timeout: {failure}"
+        );
+    }
+    let queued = queued.finish(deadline);
+    assert_eq!(
+        queued["ok"], false,
+        "queued Query must fail on the retired generation: {queued}"
+    );
+    assert_eq!(queued["error"]["code"], "transport_failed", "{queued}");
+    assert_eq!(queued["error"]["delivery"], "uncertain", "{queued}");
+    assert_eq!(queued["error"]["retry"], "unsafe", "{queued}");
+    wait_for_write_retirement(&fixture, &marker, deadline);
+    let old_events = fs::read_to_string(&events).unwrap();
+    assert!(
+        !old_events.contains("fixture/never-after-failed-write"),
+        "{old_events}"
+    );
+    assert!(!old_events.contains("fixture/write-stall"), "{old_events}");
+    // Retirement is generation-local: a later independent invocation may start healthy state.
+    let fresh = WriteCaller::spawn(
+        &fixture,
+        "fresh",
+        &[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "fixture/fresh",
+        ],
+    )
+    .finish(deadline);
+    assert_eq!(fresh["ok"], true, "{fresh}");
+    assert_ne!(fresh["context"]["ownerGeneration"], generation);
+    assert_eq!(
+        WriteCaller::spawn(
+            &fixture,
+            "stop",
+            &[
+                "session",
+                "stop",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake"
+            ]
+        )
+        .finish(deadline)["ok"],
+        true
+    );
+}
+
+#[test]
+fn owner_write_request_stall_is_bounded() {
+    check_owner_write_failure(false, false);
+}
+
+#[test]
+fn owner_write_synchronization_stall_retires_generation() {
+    check_owner_write_failure(true, false);
+}
+
+#[test]
+fn owner_write_io_failure_retires_generation() {
+    check_owner_write_failure(false, true);
+}
+
+#[test]
+fn owner_write_shutdown_uses_one_budget() {
+    let fixture = Fixture::with_configuration(
+        &[],
+        "[session]\nshutdown_timeout = '500ms'\n[synchronization]\nmax_open_documents = 2048\n",
+    );
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let marker = fixture.workspace.join("write-ready");
+    let _release = ReleaseWriteGateOnDrop(marker.clone());
+    let files: Vec<String> = (0..1024).map(|index| format!("d{index}.rs")).collect();
+    for file in &files {
+        fs::write(fixture.workspace.join(file), "fn f() {}\n").unwrap();
+    }
+    let workspace = fixture.workspace.to_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut arguments = vec![
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/open-documents",
+    ];
+    for file in &files {
+        arguments.extend(["--sync-file", file]);
+    }
+    let opened = WriteCaller::spawn(&fixture, "open", &arguments).finish(deadline);
+    assert_eq!(opened["result"]["count"], 1024, "{opened}");
+    let mut gate = WriteCaller::spawn(
+        &fixture,
+        "gate",
+        &[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "test/write-gate",
+            "--params-json",
+            &json!({"marker": marker}).to_string(),
+        ],
+    );
+    wait_for_write_marker(&marker, deadline);
+    assert_write_server_alive(&marker);
+    fs::write(marker.with_extension("start"), "release").unwrap();
+    wait_for_write_marker(&marker.with_extension("stalled"), deadline);
+    assert_write_server_alive(&marker);
+    fs::write(marker.with_extension("dispatch"), "release").unwrap();
+    assert_eq!(gate.finish(deadline)["ok"], true);
+    let started = Instant::now();
+    let stopped = WriteCaller::spawn(
+        &fixture,
+        "stop",
+        &[
+            "session",
+            "stop",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+        ],
+    )
+    .finish(deadline);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    wait_for_write_retirement(&fixture, &marker, deadline);
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "shutdown spent multiple 500ms budgets: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
