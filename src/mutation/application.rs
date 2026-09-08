@@ -4828,7 +4828,7 @@ mod tests {
                 "directory" => {
                     fs::create_dir_all(source.join("nested")).unwrap();
                     fs::write(source.join("nested/file"), original).unwrap();
-                    let nested = target.join("nested/file");
+                    let nested = target.join("nested").join("file");
                     (
                         nested.clone(),
                         vec![
