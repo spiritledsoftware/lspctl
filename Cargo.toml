@@ -52,6 +52,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [[bin]]
 name = "lspctl-fake-server"
