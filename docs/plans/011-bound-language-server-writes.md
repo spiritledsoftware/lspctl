@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — bounded/fatal writes verified; 136 tests and all compatibility gates pass
 - **Priority:** P1
 - **Effort:** M
 - **Risk:** MED
@@ -188,14 +188,52 @@ Required new tests are the three low-level and four lifecycle names listed in st
 
 ## Done criteria
 
-- [ ] Three named `frame_write_` and four named `owner_write_` tests are listed and pass.
-- [ ] Plan-005 maintenance tests and all lifecycle tests pass.
-- [ ] A failed/abandoned output attempt cannot be followed by any new frame or Query dispatch on that generation.
-- [ ] Both traced and untraced writes use one bounded seam; every write caller has the policy-table deadline.
-- [ ] Shutdown uses remaining time from one deadline, not fresh per-stage budgets.
-- [ ] Possibly transmitted requests remain uncertain/unsafe; pre-write rejection remains distinguishable.
-- [ ] Full/static/schema/state checks and `git diff --check` exit 0; no out-of-scope modification.
-- [ ] Row 011 records status and verification; plan 010 may then rely on fatal write teardown.
+- [x] Three named `frame_write_` and four named `owner_write_` tests are listed and pass.
+- [x] Plan-005 maintenance tests and all lifecycle tests pass.
+- [x] A failed/abandoned output attempt cannot be followed by any new frame or Query dispatch on that generation.
+- [x] Both traced and untraced writes use one bounded seam; every write caller has the policy-table deadline.
+- [x] Shutdown uses remaining time from one deadline, not fresh per-stage budgets.
+- [x] Possibly transmitted requests remain uncertain/unsafe; pre-write rejection remains distinguishable.
+- [x] Full/static/schema/state checks and `git diff --check` exit 0; no out-of-scope modification.
+- [x] Row 011 records status and verification; plan 010 may then rely on fatal write teardown.
+
+## Completion evidence
+
+Work for #46 began on `advisor/011-bound-language-server-writes` from clean `ebe38fe` (merged #57). Prerequisite #41 is closed. Shared-file drift from `5268c6a` was reviewed: plans 004/005/007/008/009 account for the changes; plan 005's persistent, first-priority maintenance interval is retained. Baseline full tests passed **129**, and the two `owner_maintenance_` regressions passed.
+
+The uncommitted implementation threads absolute deadlines through initialization, dispatch/synchronization, response callbacks, cancellation, shutdown, and standalone refresh batches. Header/body/flush use one low-level timeout and a cancellation-safe non-reusable bit. All runtime writers route through `write_lsp_frame`, which records fatal transport failure and uses existing process-tree cleanup. The event loop retires that generation and fails queued work; pending dispatch failures are flushed before Owner teardown. Pre-write validation does not poison the stream. Immediate I/O errors retain their source/OS code, and committed Application/Receipt outcomes are not rolled back on notification failure.
+
+### Regression and verification evidence
+
+- Exactly three `frame_write_` names listed. Initial runnable RED failed at `frame write ignored its deadline` and `failed writer accepted another frame`; the validation-preservation sibling already passed.
+- All three new low-level tests and all **nine** transport tests passed after implementation, including raw-null and unchanged outbound-limit behavior. Timeout coverage includes partial header/body and abandoned-future reuse; I/O coverage includes flush failure.
+- Exactly four `owner_write_` names listed. Initial request/synchronization fixture ordering was not reliable: queued CLI Capabilities preflight could be mistaken for queued Dispatch, allowing a small follower to overtake the large request. A retained temporary-workspace probe isolated this fixture defect.
+- Final request/synchronization tests retain real CLI 8 MiB requests/Documents and the 200 ms budget. A first fixture gate queues the CLI Capabilities preflight ahead of a second, distinctly named gate. The second gate holds the Owner until the actual CLI Dispatch is queued, then a generation-bound authenticated IPC follower is admitted behind it. Status checks require the correct active gate method, rejecting stale first-gate snapshots. I/O tests queue two actual Dispatch requests before closing stdin. All tests retain the five-second outer watchdog, live-process lock evidence, and bounded panic cleanup.
+- Revised runnable RED temporarily restored original unbounded, reusable header/body/flush behavior at the existing seam (deadline signatures retained). All four tests failed their explicit write watchdog / server-retirement assertions in **5.56s**. Bounded behavior was restored immediately afterward.
+- Work initially stopped after two unsuccessful GREEN attempts; the operator explicitly authorized renewed diagnosis. A targeted probe showed the CLI already returning structured `transport_failed` before any frame prefix: debug-build serialization can exhaust the 200 ms budget before output begins. Waiting for a prefix was therefore invalid. The final two-gate fixture does not assume that budget remains after serialization; deterministic partial-header/body/flush behavior is covered at the small-duplex seam.
+- The final two-gate fixture was checked against temporarily restored unbounded/reusable writes: all four tests failed explicit CLI-watchdog/server-retirement assertions in **5.57s**, not readiness assertions. The bounded implementation was restored afterward.
+- Independent review found and resolved two test races: stale Status gate identity and unbounded prefix reads after scheduler delays. The in-memory transport test uses already-enabled paused Tokio time and bounded prefix reads; no dependency or feature changes were needed. No additional production correctness findings remained.
+- Final lists contain exactly **3** low-level and **4** lifecycle names. All **9** transport tests, **2** maintenance tests, **30** lifecycle tests, and **136** full tests pass. Ten consecutive focused lifecycle repetitions passed (**40/40** individual tests).
+- Formatting, Clippy `-D warnings`, schema compatibility, stored-state compatibility, and `git diff --check` pass. Only the four allowed implementation files and this plan/index are modified. Verified locally on Linux Rust **1.98.1**; native Windows/macOS and MSRV 1.89 were not run locally.
+
+Local diagnostic logs: `/tmp/46-frame-red.log`, `/tmp/46-owner-revised-red.log`, `/tmp/46-owner-green1.log`, `/tmp/46-owner-green2.log`, `/tmp/46-owner-final-red.log`, `/tmp/46-lifecycle-final.log`, `/tmp/46-full-final.log`. Retained manual-probe workspaces contain only isolated fixture state, including test authentication material; do not publish their contents.
+
+### Outbound caller audit
+
+| Runtime caller | Supplied absolute budget |
+| --- | --- |
+| `initialize`: initialize request, initialization callback responses, initialized notification | One initialization deadline established before the first write |
+| `start_dispatch`: best-effort refresh, explicit Document synchronization, traced request | One selected request deadline, retained by `ActiveQuery` |
+| `handle_concurrent_frame`: post-response Document validation | Remaining request deadline |
+| Partial-result cancellation and `maintain_active_queries` | Newly established cancellation-grace deadline, not expired request deadline |
+| `write_server_response`: invalid/busy/cancelled server requests and routed/apply-edit responses | Active Query/cancellation phase, or enclosing standalone/shutdown batch deadline; rechecks phase after draining frames |
+| Apply-edit post-commit synchronization | Enclosing callback's active Query deadline; committed ledger/Receipt retained on failure |
+| Owner Diagnostics / RefreshDocuments | One shutdown-duration deadline per standalone batch, including file operations and all synchronization events |
+| `send_synchronization_events` / `send_file_operation_notifications` | Explicit enclosing batch deadline forwarded to every notification |
+| `graceful_shutdown`: closes, shutdown, callbacks/response wait, exit, child wait | One deadline established before closes; child wait uses `timeout_at`, poisoned writer is not reused |
+| `write_lsp_message`, `write_lsp_message_traced`, `write_server_response` | All call `write_lsp_frame`; it is the only production caller of `write_json_rpc_frame_with_bytes` |
+
+Changes remain uncommitted for operator review; no push or PR was made. Plan 010 may rely on fatal write teardown, but its Document synchronization ordering work is not implemented here.
 
 ## STOP conditions
 

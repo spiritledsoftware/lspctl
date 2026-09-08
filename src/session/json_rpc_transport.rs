@@ -137,6 +137,7 @@ impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
 pub(crate) struct JsonRpcFrameWriter<W> {
     output: W,
     max_body_bytes: NonZeroUsize,
+    reusable: bool,
 }
 
 impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
@@ -154,6 +155,7 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
         Self {
             output,
             max_body_bytes,
+            reusable: true,
         }
     }
 
@@ -163,16 +165,30 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
         &mut self,
         message: &Value,
     ) -> Result<(), JsonRpcTransportError> {
-        self.write_json_rpc_frame_with_bytes(message)
-            .await
-            .map(|_| ())
+        self.write_json_rpc_frame_with_bytes(
+            message,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.reusable
     }
 
     /// Writes one message and returns its exact header and body for explicit tracing.
     pub(crate) async fn write_json_rpc_frame_with_bytes(
         &mut self,
         message: &Value,
+        deadline: tokio::time::Instant,
     ) -> Result<(Vec<u8>, Vec<u8>), JsonRpcTransportError> {
+        if !self.reusable {
+            return Err(JsonRpcTransportError::WriteFrame(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "A previous JSON-RPC frame write did not complete",
+            )));
+        }
         if !message.is_object() {
             return Err(JsonRpcTransportError::MessageNotObject);
         }
@@ -186,18 +202,27 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
         }
 
         let header = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        self.output
-            .write_all(&header)
-            .await
-            .map_err(JsonRpcTransportError::WriteFrame)?;
-        self.output
-            .write_all(&body)
-            .await
-            .map_err(JsonRpcTransportError::WriteFrame)?;
-        self.output
-            .flush()
-            .await
-            .map_err(JsonRpcTransportError::WriteFrame)?;
+        // Cancellation drops this future without clearing the bit: never append to a partial frame.
+        self.reusable = false;
+        let timeout_error =
+            || io::Error::new(io::ErrorKind::TimedOut, "JSON-RPC frame write timed out");
+        tokio::time::timeout_at(deadline, async {
+            // Ready I/O must not bypass a budget already spent serializing/synchronizing.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            self.output.write_all(&header).await?;
+            self.output.write_all(&body).await?;
+            self.output.flush().await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| JsonRpcTransportError::WriteFrame(timeout_error()))?
+        .map_err(JsonRpcTransportError::WriteFrame)?;
+        self.reusable = true;
         Ok((header, body))
     }
 }
@@ -502,6 +527,164 @@ mod tests {
         receiver.read_to_end(&mut wire).await.unwrap();
         let body = wire.split(|byte| *byte == b'\n').next_back().unwrap();
         assert!(str::from_utf8(body).unwrap().contains("\"params\":null"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_write_timeout_poisons_partial_frame() {
+        use tokio::time::{Duration, Instant, timeout};
+        // Capacity three stalls within the header; capacity 64 stalls within the body.
+        for capacity in [3, 64] {
+            let (sender, mut receiver) = duplex(capacity);
+            let mut writer = JsonRpcFrameWriter::new(sender);
+            let message = json!({"payload": "x".repeat(256)});
+            let result = timeout(
+                Duration::from_millis(200),
+                writer.write_json_rpc_frame_with_bytes(
+                    &message,
+                    Instant::now() + Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("frame write ignored its deadline");
+            assert!(
+                matches!(result, Err(JsonRpcTransportError::WriteFrame(error)) if error.kind() == io::ErrorKind::TimedOut)
+            );
+            let mut prefix = vec![0; capacity];
+            timeout(Duration::from_millis(100), receiver.read_exact(&mut prefix))
+                .await
+                .expect("write produced no partial frame")
+                .unwrap();
+            assert!(
+                timeout(
+                    Duration::from_millis(100),
+                    writer.write_json_rpc_frame(&json!({}))
+                )
+                .await
+                .expect("poisoned writer blocked")
+                .is_err()
+            );
+            drop(writer);
+            let mut remainder = Vec::new();
+            receiver.read_to_end(&mut remainder).await.unwrap();
+            assert!(remainder.is_empty(), "a new frame followed a partial frame");
+        }
+        // Dropping an in-flight future must poison the writer even without its own timeout.
+        let (sender, mut receiver) = duplex(3);
+        let mut writer = JsonRpcFrameWriter::new(sender);
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                writer.write_json_rpc_frame(&json!({}))
+            )
+            .await
+            .is_err()
+        );
+        let mut prefix = [0; 3];
+        timeout(Duration::from_millis(100), receiver.read_exact(&mut prefix))
+            .await
+            .expect("cancelled write produced no partial frame")
+            .unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                writer.write_json_rpc_frame(&json!({}))
+            )
+            .await
+            .expect("cancelled writer blocked")
+            .is_err()
+        );
+        drop(writer);
+        let mut remainder = Vec::new();
+        receiver.read_to_end(&mut remainder).await.unwrap();
+        assert!(remainder.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_write_io_error_poisons_partial_frame() {
+        use std::{
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        struct FailingWriter {
+            bytes: Arc<AtomicUsize>,
+            flush_error: bool,
+            failed: bool,
+        }
+        impl AsyncWrite for FailingWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if !self.flush_error && !self.failed && self.bytes.load(Ordering::SeqCst) > 0 {
+                    self.failed = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected write failure",
+                    )));
+                }
+                let count = if self.flush_error || self.failed {
+                    bytes.len()
+                } else {
+                    3.min(bytes.len())
+                };
+                self.bytes.fetch_add(count, Ordering::SeqCst);
+                Poll::Ready(Ok(count))
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                if self.flush_error && !self.failed {
+                    self.failed = true;
+                    Poll::Ready(Err(io::Error::other("injected flush failure")))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        for flush_error in [false, true] {
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let mut writer = JsonRpcFrameWriter::new(FailingWriter {
+                bytes: Arc::clone(&bytes),
+                flush_error,
+                failed: false,
+            });
+            assert!(matches!(
+                writer.write_json_rpc_frame(&json!({})).await,
+                Err(JsonRpcTransportError::WriteFrame(_))
+            ));
+            let before = bytes.load(Ordering::SeqCst);
+            assert!(before > 0);
+            assert!(
+                writer.write_json_rpc_frame(&json!({})).await.is_err(),
+                "failed writer accepted another frame"
+            );
+            assert_eq!(bytes.load(Ordering::SeqCst), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_write_validation_error_preserves_stream() {
+        let (sender, mut receiver) = duplex(64);
+        let mut writer = JsonRpcFrameWriter::with_body_limit(sender, NonZeroUsize::new(2).unwrap());
+        assert!(matches!(
+            writer.write_json_rpc_frame(&json!({"too": "large"})).await,
+            Err(JsonRpcTransportError::OutboundBodyTooLarge { .. })
+        ));
+        assert!(matches!(
+            writer.write_json_rpc_frame(&Value::Null).await,
+            Err(JsonRpcTransportError::MessageNotObject)
+        ));
+        writer.write_json_rpc_frame(&json!({})).await.unwrap();
+        drop(writer);
+        let mut wire = Vec::new();
+        receiver.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, b"Content-Length: 2\r\n\r\n{}");
     }
 
     #[tokio::test]

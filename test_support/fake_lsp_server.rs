@@ -656,6 +656,52 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            Some("test/write-gate" | "test/write-dispatch-gate") => {
+                // Keep the process alive independently of stdin, including on a broken pipe.
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_secs(10));
+                    std::process::exit(1);
+                });
+                let marker = PathBuf::from(message["params"]["marker"].as_str().unwrap());
+                let lifetime = File::create(marker.with_extension("lock")).unwrap();
+                lifetime.lock().unwrap();
+                std::fs::write(&marker, "ready\n").unwrap();
+                while !marker.with_extension("start").exists() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if message["params"]["breakInput"] == true {
+                    // No further stdin access follows: transfer and close its process-owned handle.
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::{AsRawFd, FromRawFd};
+                        unsafe { drop(File::from_raw_fd(input.get_ref().as_raw_fd())) };
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+                        unsafe { drop(File::from_raw_handle(input.get_ref().as_raw_handle())) };
+                    }
+                    std::fs::write(marker.with_extension("stalled"), "input closed\n").unwrap();
+                    while !marker.with_extension("dispatch").exists() {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
+                        return ExitCode::from(1);
+                    }
+                    thread::sleep(Duration::from_secs(10));
+                    return ExitCode::SUCCESS;
+                }
+                std::fs::write(marker.with_extension("stalled"), "not reading\n").unwrap();
+                while !marker.with_extension("dispatch").exists() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+                while !marker.with_extension("resume").exists() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
             Some("test/notification-flood") if scenario == Scenario::NotificationFlood => {
                 return notification_flood(input, &mut output, event_log, &message);
             }
