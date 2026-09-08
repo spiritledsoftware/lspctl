@@ -187,6 +187,8 @@ pub(crate) struct WorkspaceEditPlanner<'a> {
 struct ResourceState {
     manifest: ManifestEntry,
     text: Option<Vec<u8>>,
+    // Physical source survives virtual renames until text is loaded.
+    text_source: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -885,6 +887,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         next.manifest.resource_kind = ResourceKind::File;
         next.manifest.content_digest = Some(digest_raw_bytes(&[]));
         next.text = Some(Vec::new());
+        next.text_source = None;
         workspace.entries.insert(path.clone(), next);
         workspace.affected.insert(path.clone());
         summary.creates = summary.creates.saturating_add(1);
@@ -1314,8 +1317,10 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 && workspace.entries[path].manifest.exists
                 && workspace.entries[path].manifest.resource_kind == ResourceKind::File
             {
+                let source = workspace.entries[path].text_source.as_deref().unwrap();
+                self.validate_existing_ancestors(source, index)?;
                 let bytes =
-                    read_text_file(path, self.preview_limits.max_document_text_bytes, index)?;
+                    read_text_file(source, self.preview_limits.max_document_text_bytes, index)?;
                 workspace.entries.get_mut(path).unwrap().text = Some(bytes);
             }
             return Ok(());
@@ -1560,6 +1565,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 metadata_digest: Some(metadata_digest(path, &metadata, index)?),
             },
             text,
+            text_source: (resource_kind == ResourceKind::File).then(|| path.to_path_buf()),
         })
     }
 
@@ -1939,6 +1945,7 @@ fn missing_resource(path: &Path) -> ResourceState {
     ResourceState {
         manifest: missing_manifest(path),
         text: None,
+        text_source: None,
     }
 }
 
@@ -2544,6 +2551,109 @@ mod tests {
                 max_preauthorized_callbacks: 64,
             },
         )
+    }
+
+    #[test]
+    fn ordered_preview_planner_tracks_renamed_text_sources() {
+        for (directory, chained) in [(false, false), (true, false), (false, true), (true, true)] {
+            let workspace = TempDir::new().unwrap();
+            let source = workspace.path().join("source");
+            let intermediate = workspace.path().join("intermediate");
+            let destination = workspace.path().join("destination");
+            let source_file = if directory {
+                fs::create_dir_all(source.join("nested")).unwrap();
+                source.join("nested/text.txt")
+            } else {
+                source.clone()
+            };
+            let destination_file = if directory {
+                destination.join("nested/text.txt")
+            } else {
+                destination.clone()
+            };
+            let original = "a😀z\r\n";
+            fs::write(&source_file, original).unwrap();
+            let uri = |path: &Path| Url::from_file_path(path).unwrap();
+            let rename = |from: &Path, to: &Path| json!({"kind": "rename", "oldUri": uri(from), "newUri": uri(to)});
+            let mut operations = if chained {
+                vec![
+                    rename(&source, &intermediate),
+                    rename(&intermediate, &destination),
+                ]
+            } else {
+                vec![rename(&source, &destination)]
+            };
+            let text_edit = json!({"textDocument": {"uri": uri(&destination_file), "version": null},
+                "edits": [{"range": {"start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 4}}, "newText": "long"}]});
+            operations.push(text_edit.clone());
+            let edit = json!({"documentChanges": operations});
+            let (mut previews, mutation) = settings();
+            let planned = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf16,
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .plan_workspace_edit(&edit)
+            .unwrap();
+            let CanonicalOperation::Text {
+                path,
+                before_digest,
+                after_digest,
+                edits,
+                ..
+            } = planned.plan.operations.last().unwrap()
+            else {
+                panic!("missing text operation")
+            };
+            assert_eq!(path, &destination_file);
+            assert_eq!(before_digest, &digest_raw_bytes(original.as_bytes()));
+            assert_eq!(after_digest, &digest_raw_bytes("a😀long\r\n".as_bytes()));
+            assert_eq!((edits[0].start_byte, edits[0].end_byte), (5, 6));
+            assert_eq!(fs::read(&source_file).unwrap(), original.as_bytes());
+            assert!(!destination.exists());
+            assert!(!intermediate.exists());
+
+            // A moved file still obeys the existing lazy read's per-Document bound.
+            previews.max_document_text_bytes = original.len() as u64 - 1;
+            let problems = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf16,
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .plan_workspace_edit(&edit)
+            .unwrap_err();
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.code == "resource_limit_exceeded")
+            );
+            previews.max_document_text_bytes = 1_000_000;
+            // Deleting the virtual destination must not reload its still-present physical source.
+            operations.pop();
+            operations.push(json!({"kind": "delete", "uri": uri(&destination),
+                "options": {"recursive": true}}));
+            operations.push(text_edit);
+            let problems = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf16,
+                &previews,
+                &mutation,
+            )
+            .unwrap()
+            .plan_workspace_edit(&json!({"documentChanges": operations}))
+            .unwrap_err();
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.code == "unsupported_resource_kind")
+            );
+            assert_eq!(fs::read(&source_file).unwrap(), original.as_bytes());
+        }
     }
 
     #[test]

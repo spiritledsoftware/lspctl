@@ -102,6 +102,12 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
     let mut workspace_uri = None;
     let mut partial_limit_request = None;
     let mut open_documents = BTreeMap::new();
+    let mut related_mode = env::args().find_map(|argument| {
+        argument
+            .strip_prefix("--related-diagnostics=")
+            .map(str::to_owned)
+    });
+    let mut diagnostic_revision = 0;
     loop {
         let message = match read_frame(&mut input) {
             Ok(Some(message)) => message,
@@ -175,7 +181,7 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                         "codeActionProvider": {"resolveProvider": true},
                         "executeCommandProvider": {"commands": ["fixture.run"]},
                         "diagnosticProvider": {
-                            "interFileDependencies": false,
+                            "interFileDependencies": related_mode.is_some(),
                             "workspaceDiagnostics": true
                         }
                     })
@@ -309,6 +315,28 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
             Some("textDocument/hover") | Some("textDocument/prepareRename") => {
                 if result(&mut output, &message, Value::Null, scenario).is_err() {
                     return ExitCode::from(1);
+                }
+            }
+            Some("test/related-diagnostics-mode") if related_mode.is_some() => {
+                related_mode = Some(message["params"]["mode"].as_str().unwrap().to_owned());
+                if result(&mut output, &message, Value::Null, scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/diagnostic" | "workspace/diagnostic")
+                if related_mode.is_some() =>
+            {
+                match related_diagnostics(
+                    &mut output,
+                    &message,
+                    workspace_uri.as_ref().unwrap(),
+                    related_mode.as_deref().unwrap(),
+                    &mut diagnostic_revision,
+                    scenario,
+                ) {
+                    Ok(true) => partial_limit_request = Some(message["id"].clone()),
+                    Ok(false) => {}
+                    Err(()) => return ExitCode::from(1),
                 }
             }
             Some("textDocument/diagnostic") => {
@@ -815,6 +843,136 @@ fn notification_flood(
             next_notification = Instant::now() + Duration::from_millis(5);
         }
     }
+}
+
+fn related_diagnostics(
+    output: &mut impl Write,
+    request: &Value,
+    workspace: &url::Url,
+    mode: &str,
+    revision: &mut usize,
+    scenario: Scenario,
+) -> Result<bool, ()> {
+    let workspace_report = request["method"] == "workspace/diagnostic";
+    let main = workspace.join("main.rs").unwrap().to_string();
+    let related = workspace.join("related.rs").unwrap().to_string();
+    let previous = format!("main-{revision}");
+    let expected = if workspace_report {
+        request["params"]["previousResultIds"]
+            .as_array()
+            .is_some_and(|ids| {
+                ids.iter()
+                    .any(|entry| entry["uri"] == main && entry["value"] == previous)
+                    && ids.iter().any(|entry| {
+                        entry["uri"] == related && entry["value"] == format!("related-{revision}")
+                    })
+            })
+    } else {
+        request["params"]["previousResultId"] == previous
+    };
+    if *revision > 0 && !expected {
+        write_frame(
+            output,
+            &json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":-32603, "message":"fixture received stale previous diagnostic IDs", "data": request["params"]}
+            }),
+            scenario,
+        )?;
+        return Ok(false);
+    }
+    let full = |name: &str, id: String| {
+        json!({
+            "kind":"full", "resultId":id,
+            "items":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}, "message":name}]
+        })
+    };
+    let next = *revision + 1;
+    let report = |name: &str| {
+        if *revision == 0 {
+            full(name, format!("{name}-{next}"))
+        } else {
+            json!({"kind":"unchanged", "resultId":format!("{name}-{next}")})
+        }
+    };
+    let mut main_report = report("main");
+    let related_report = report("related");
+    let progress = |value| {
+        json!({
+            "jsonrpc":"2.0", "method":"$/progress",
+            "params":{"token":request["params"]["partialResultToken"], "value":value}
+        })
+    };
+    match mode {
+        "malformed" => {
+            result(
+                output,
+                request,
+                json!({"kind":"full","resultId":"poison","items":17}),
+                scenario,
+            )?;
+        }
+        "raw-malformed" => {
+            result(output, request, json!(17), scenario)?;
+        }
+        "unresolved" => {
+            let mut rejected = full("poison", "poison".to_owned());
+            rejected["relatedDocuments"] = json!({
+                (workspace.join("uncached.rs").unwrap().as_str()): {"kind":"unchanged","resultId":"poison"}
+            });
+            result(output, request, rejected, scenario)?;
+        }
+        "error" | "cancel" => {
+            write_frame(
+                output,
+                &progress(json!({"relatedDocuments": {
+                    (related): full("poison", "poison".to_owned())
+                }})),
+                scenario,
+            )?;
+            if mode == "cancel" {
+                // The existing partial-byte limit initiates cancellation, then the main loop acknowledges it.
+                return Ok(true);
+            }
+            write_frame(
+                output,
+                &json!({
+                    "jsonrpc":"2.0", "id":request["id"],
+                    "error":{"code":-32603,"message":"fixture diagnostic failure"}
+                }),
+                scenario,
+            )?;
+        }
+        _ => {
+            if workspace_report {
+                main_report["uri"] = json!(main);
+                main_report["version"] = Value::Null;
+                let mut related_report = related_report;
+                related_report["uri"] = json!(related);
+                related_report["version"] = Value::Null;
+                write_frame(
+                    output,
+                    &progress(json!({"items":[related_report]})),
+                    scenario,
+                )?;
+                result(output, request, json!({"items":[main_report]}), scenario)?;
+            } else {
+                let related_reports = json!({(related): related_report});
+                if mode == "partial" {
+                    write_frame(
+                        output,
+                        &progress(json!({"relatedDocuments":related_reports})),
+                        scenario,
+                    )?;
+                } else {
+                    main_report["relatedDocuments"] = related_reports;
+                }
+                result(output, request, main_report, scenario)?;
+            }
+            *revision = next;
+        }
+    }
+    Ok(false)
 }
 
 fn update_open_documents(message: &Value, open_documents: &mut BTreeMap<String, String>) {

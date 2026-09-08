@@ -1831,6 +1831,56 @@ fn stage_text_outputs(
     operations: &[CanonicalOperation],
     limits: &MutationSettings,
 ) -> Result<(), ContractFailure> {
+    visit_canonical_text_outputs(
+        &transaction.transaction_id,
+        operations,
+        limits,
+        |operation, text| {
+            let Some((_, after)) = text else {
+                return Ok(());
+            };
+            let staged_path =
+                staged_text_path(&transaction.artifact_directory, operation_index(operation));
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged_path)
+                .map_err(|error| {
+                    stage_failure(
+                        &transaction.transaction_id,
+                        "A text output cannot be created in staging.",
+                        error.raw_os_error(),
+                    )
+                })?;
+            state_permissions::restrict_file(&staged_path).map_err(|error| {
+                stage_failure(
+                    &transaction.transaction_id,
+                    "A staged text output cannot be made private.",
+                    error.raw_os_error(),
+                )
+            })?;
+            staged
+                .write_all(after)
+                .and_then(|()| staged.sync_all())
+                .map_err(|error| {
+                    stage_failure(
+                        &transaction.transaction_id,
+                        "A staged text output cannot be flushed.",
+                        error.raw_os_error(),
+                    )
+                })
+        },
+    )
+}
+
+/// Evaluates canonical operations once, in order, for staging and non-mutating presentation.
+/// Text visits borrow the immediately preceding virtual bytes and their validated replacement.
+pub(crate) fn visit_canonical_text_outputs(
+    context_id: &str,
+    operations: &[CanonicalOperation],
+    limits: &MutationSettings,
+    mut visit: impl FnMut(&CanonicalOperation, Option<(&[u8], &[u8])>) -> Result<(), ContractFailure>,
+) -> Result<(), ContractFailure> {
     let mut texts = BTreeMap::<PathBuf, Vec<u8>>::new();
     let mut unavailable = Vec::<PathBuf>::new();
     let mut aliases = Vec::<(PathBuf, PathBuf)>::new();
@@ -1848,23 +1898,23 @@ fn stage_text_outputs(
                 let before =
                     virtual_text(path, &texts, &unavailable, &aliases).map_err(|error| {
                         stage_failure(
-                            &transaction.transaction_id,
+                            context_id,
                             "A text input cannot be staged.",
                             error.raw_os_error(),
                         )
                     })?;
                 if digest_raw_bytes(&before) != *before_digest {
                     return Err(stage_failure(
-                        &transaction.transaction_id,
+                        context_id,
                         "A staged text input no longer matches its canonical digest.",
                         None,
                     ));
                 }
                 let after = apply_canonical_text_edits(&before, edits)
-                    .map_err(|reason| stage_failure(&transaction.transaction_id, &reason, None))?;
+                    .map_err(|reason| stage_failure(context_id, &reason, None))?;
                 if digest_raw_bytes(&after) != *after_digest {
                     return Err(stage_failure(
-                        &transaction.transaction_id,
+                        context_id,
                         "A staged text output does not match its canonical digest.",
                         None,
                     ));
@@ -1887,35 +1937,7 @@ fn stage_text_outputs(
                         }),
                     });
                 }
-                let staged_path = staged_text_path(&transaction.artifact_directory, *index);
-                let mut staged = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staged_path)
-                    .map_err(|error| {
-                        stage_failure(
-                            &transaction.transaction_id,
-                            "A text output cannot be created in staging.",
-                            error.raw_os_error(),
-                        )
-                    })?;
-                state_permissions::restrict_file(&staged_path).map_err(|error| {
-                    stage_failure(
-                        &transaction.transaction_id,
-                        "A staged text output cannot be made private.",
-                        error.raw_os_error(),
-                    )
-                })?;
-                staged
-                    .write_all(&after)
-                    .and_then(|()| staged.sync_all())
-                    .map_err(|error| {
-                        stage_failure(
-                            &transaction.transaction_id,
-                            "A staged text output cannot be flushed.",
-                            error.raw_os_error(),
-                        )
-                    })?;
+                visit(operation, Some((&before, &after)))?;
                 texts.insert(path.clone(), after);
                 unavailable.retain(|root| root != path);
             }
@@ -1951,6 +1973,9 @@ fn stage_text_outputs(
                 texts.retain(|candidate, _| !candidate.starts_with(path));
                 unavailable.push(path.clone());
             }
+        }
+        if !matches!(operation, CanonicalOperation::Text { .. }) {
+            visit(operation, None)?;
         }
     }
     Ok(())
@@ -1999,12 +2024,20 @@ fn apply_canonical_text_edits(
     before: &[u8],
     edits: &[super::planner::CanonicalTextEdit],
 ) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(before)
+        .map_err(|_| "A canonical staged text input is not valid UTF-8.".to_owned())?;
     let mut after = Vec::with_capacity(before.len());
     let mut cursor = 0;
     for edit in edits {
-        let start = edit.start_byte as usize;
-        let end = edit.end_byte as usize;
-        if start < cursor || end < start || end > before.len() {
+        let start = usize::try_from(edit.start_byte)
+            .map_err(|_| "A canonical staged text edit offset is too large.".to_owned())?;
+        let end = usize::try_from(edit.end_byte)
+            .map_err(|_| "A canonical staged text edit offset is too large.".to_owned())?;
+        if start < cursor
+            || end < start
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
             return Err("A canonical staged text edit range is invalid.".to_owned());
         }
         after.extend_from_slice(&before[cursor..start]);
@@ -4751,6 +4784,207 @@ mod tests {
             fs::read_to_string(sentinel).unwrap(),
             "owned by the workspace"
         );
+    }
+
+    #[test]
+    fn ordered_preview_matches_staged_outputs() {
+        use super::super::tests::{stored_preview, text_change};
+
+        for case in [
+            "create",
+            "rename",
+            "repeated",
+            "directory",
+            "overwrite",
+            "recreate",
+        ] {
+            let workspace = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+            let source = workspace.path().join("source");
+            let target = workspace.path().join("target");
+            let uri = |path: &Path| url::Url::from_file_path(path).unwrap();
+            let original = "é🦀old\r\n";
+            let (file, edits, expected) = match case {
+                "create" => (
+                    target.clone(),
+                    vec![
+                        json!({"kind": "create", "uri": uri(&target)}),
+                        text_change(&target, 0, 0, original),
+                    ],
+                    vec![("", original)],
+                ),
+                "rename" => {
+                    fs::write(&source, original).unwrap();
+                    (
+                        target.clone(),
+                        vec![
+                            json!({"kind": "rename", "oldUri": uri(&source), "newUri": uri(&target)}),
+                            text_change(&target, 3, 6, "new"),
+                        ],
+                        vec![(original, "é🦀new\r\n")],
+                    )
+                }
+                "directory" => {
+                    fs::create_dir_all(source.join("nested")).unwrap();
+                    fs::write(source.join("nested/file"), original).unwrap();
+                    let nested = target.join("nested").join("file");
+                    (
+                        nested.clone(),
+                        vec![
+                            json!({"kind": "rename", "oldUri": uri(&source), "newUri": uri(&target)}),
+                            text_change(&nested, 3, 6, "new"),
+                        ],
+                        vec![(original, "é🦀new\r\n")],
+                    )
+                }
+                "repeated" => {
+                    fs::write(&source, original).unwrap();
+                    (
+                        source.clone(),
+                        vec![
+                            text_change(&source, 3, 6, "longer"),
+                            text_change(&source, 7, 9, "est"),
+                        ],
+                        vec![
+                            (original, "é🦀longer\r\n"),
+                            ("é🦀longer\r\n", "é🦀longest\r\n"),
+                        ],
+                    )
+                }
+                "overwrite" | "recreate" => {
+                    fs::write(&target, b"physical old contents\n").unwrap();
+                    let mut edits = Vec::new();
+                    if case == "recreate" {
+                        edits.push(json!({"kind": "delete", "uri": uri(&target)}));
+                    }
+                    edits.push(json!({"kind": "create", "uri": uri(&target), "options": {"overwrite": true}}));
+                    edits.push(text_change(&target, 0, 0, original));
+                    (target.clone(), edits, vec![("", original)])
+                }
+                _ => unreachable!(),
+            };
+            let edit = json!({"documentChanges": edits});
+            let stored = stored_preview(workspace.path(), edit.clone());
+            let (previews, _, mutation) = super::super::default_mutation_settings();
+            let planner = WorkspaceEditPlanner::open(
+                workspace.path(),
+                PositionEncoding::Utf16,
+                &previews,
+                &mutation,
+            )
+            .unwrap();
+            let transaction = provenance_transaction(workspace.path(), &planner, edit);
+            let before = planner
+                .inspect_manifest(&stored.preview.plan.before_manifest)
+                .unwrap();
+            let mut projected = Vec::new();
+            let mut notices = String::new();
+            visit_canonical_text_outputs(
+                "test",
+                &stored.preview.plan.operations,
+                &mutation,
+                |operation, text| {
+                    if let Some((old, new)) = text {
+                        let expected = expected[projected.len()];
+                        assert_eq!(old, expected.0.as_bytes(), "{case}");
+                        assert_eq!(new, expected.1.as_bytes(), "{case}");
+                        projected.push((operation_index(operation), new.to_vec()));
+                        notices.push_str(&super::super::contextual_text_diff(
+                            &file, expected.0, expected.1,
+                        ));
+                    } else {
+                        match operation {
+                            CanonicalOperation::Create { path, .. } => {
+                                notices.push_str(&format!("create {}\n", path.display()))
+                            }
+                            CanonicalOperation::Rename {
+                                old_path, new_path, ..
+                            } => notices.push_str(&format!(
+                                "rename {} -> {}\n",
+                                old_path.display(),
+                                new_path.display()
+                            )),
+                            CanonicalOperation::Delete { path, .. } => {
+                                notices.push_str(&format!("delete {}\n", path.display()))
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(projected.len(), expected.len(), "{case}");
+            assert_eq!(
+                super::super::preview_diff(&stored, &mutation).unwrap(),
+                notices,
+                "{case}"
+            );
+            for (old, new) in &expected {
+                if !old.is_empty() {
+                    assert!(notices.contains(&format!("-{old}")), "{case}: {notices:?}");
+                }
+                assert!(notices.contains(&format!("+{new}")), "{case}: {notices:?}");
+            }
+            assert!(!transaction.artifact_directory.exists());
+            assert!(store.list_transactions().unwrap().is_empty());
+            assert_eq!(
+                planner
+                    .inspect_manifest(&stored.preview.plan.before_manifest)
+                    .unwrap(),
+                before
+            );
+            stage_transaction(&transaction, &transaction.operations, &mutation).unwrap();
+            for (index, bytes) in &projected {
+                let path = staged_text_path(&transaction.artifact_directory, *index);
+                let staged = fs::read(&path).unwrap();
+                assert_eq!(&staged, bytes, "{case}");
+                let CanonicalOperation::Text { after_digest, .. } = transaction
+                    .operations
+                    .iter()
+                    .find(|operation| operation_index(operation) == *index)
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(&digest_raw_bytes(&staged), after_digest, "{case}");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+                }
+            }
+            assert_eq!(
+                fs::read_to_string(transaction.artifact_directory.join(ARTIFACT_OWNER_FILE))
+                    .unwrap(),
+                transaction.transaction_id
+            );
+            assert_eq!(
+                planner
+                    .inspect_manifest(&stored.preview.plan.before_manifest)
+                    .unwrap(),
+                before
+            );
+            cleanup_transaction_artifacts(&transaction).unwrap();
+            let mut limited = mutation.clone();
+            limited.max_staged_text_bytes = projected
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+                - 1;
+            assert!(super::super::preview_diff(&stored, &limited).is_none());
+            let failure =
+                stage_transaction(&transaction, &transaction.operations, &limited).unwrap_err();
+            assert_eq!(failure.failure.code, "resource_limit_exceeded");
+            cleanup_transaction_artifacts(&transaction).unwrap();
+            assert_eq!(
+                planner
+                    .inspect_manifest(&stored.preview.plan.before_manifest)
+                    .unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

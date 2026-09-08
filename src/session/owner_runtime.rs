@@ -1027,7 +1027,6 @@ impl LspRuntime {
                 OwnerResponse::failure(owner_generation, failure)
             } else if message.get("result").is_some() {
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
-                self.record_pull_diagnostics(&query.method, query.params.as_ref(), &result);
                 match self
                     .validate_documents_after_query(
                         &query.validated_documents,
@@ -1038,6 +1037,12 @@ impl LspRuntime {
                     .await
                 {
                     Ok(changed) => {
+                        self.record_pull_diagnostics(
+                            &query.method,
+                            query.params.as_ref(),
+                            &result,
+                            &query.partial_chunks,
+                        );
                         query.synchronization["postResponseChanged"] = Value::Array(changed);
                         let mut output = json!({
                             "result": result,
@@ -1962,20 +1967,34 @@ impl LspRuntime {
         Ok(())
     }
 
-    fn record_pull_diagnostics(&mut self, method: &str, params: Option<&Value>, result: &Value) {
-        match method {
-            "textDocument/diagnostic" => {
-                if let Some(uri) = params
-                    .and_then(|params| params.pointer("/textDocument/uri"))
-                    .and_then(Value::as_str)
-                {
-                    self.diagnostics.apply_pull_report(uri, result.clone());
-                }
+    fn record_pull_diagnostics(
+        &mut self,
+        method: &str,
+        params: Option<&Value>,
+        result: &Value,
+        partial_chunks: &[Value],
+    ) {
+        use crate::query::{QueryCommand, merge_partial_results, normalize_named_result};
+        let command = match method {
+            "textDocument/diagnostic" => QueryCommand::DocumentDiagnostics,
+            "workspace/diagnostic" => QueryCommand::WorkspaceDiagnostics,
+            _ => return,
+        };
+        // Cache validated effective content separately from exact raw Query evidence.
+        let Ok(report) = merge_partial_results(command, result.clone(), partial_chunks.to_vec())
+            .and_then(|report| normalize_named_result(command, report))
+        else {
+            return;
+        };
+        if command == QueryCommand::DocumentDiagnostics {
+            if let Some(uri) = params
+                .and_then(|params| params.pointer("/textDocument/uri"))
+                .and_then(Value::as_str)
+            {
+                self.diagnostics.apply_document_pull_report(uri, report);
             }
-            "workspace/diagnostic" => {
-                self.diagnostics.apply_workspace_pull_report(result.clone());
-            }
-            _ => {}
+        } else {
+            self.diagnostics.apply_workspace_pull_report(report);
         }
     }
 
@@ -3439,6 +3458,69 @@ mod tests {
         })
         .await
         .expect("authenticated Query test watchdog");
+    }
+
+    #[test]
+    fn recursive_glob_file_operation_filters_reject_filename_suffixes() {
+        let filter = json!({
+            "scheme": "file",
+            "pattern": {"glob": "**/main.rs", "matches": "file", "options": {"ignoreCase": false}}
+        });
+        let mut initialized = json!({"capabilities": {"workspace": {"fileOperations": {
+            "didRename": {"filters": [filter.clone()]},
+            "didCreate": {"filters": [filter]}
+        }}}});
+        for (old, new, expected) in [
+            ("domain.rs", "other.rs", false),
+            ("other.rs", "domain.rs", false),
+            ("main.rs", "other.rs", true),
+            ("other.rs", "nested/main.rs", true),
+        ] {
+            let operation = json!({
+                "kind": "rename", "oldUri": format!("file:///workspace/{old}"),
+                "newUri": format!("file:///workspace/{new}"), "isDirectory": false
+            });
+            assert_eq!(
+                file_operation_registered(&initialized, "didRename", &operation),
+                expected,
+                "{old} -> {new}"
+            );
+        }
+        for (name, directory, expected) in [
+            ("domain.rs", false, false),
+            ("main.rs", false, true),
+            ("main.rs", true, false),
+            ("MAIN.RS", false, false),
+        ] {
+            assert_eq!(
+                file_operation_registered(
+                    &initialized,
+                    "didCreate",
+                    &json!({
+                        "kind": "create", "uri": format!("file:///workspace/{name}"),
+                        "isDirectory": directory
+                    })
+                ),
+                expected,
+                "create {name}, directory={directory}"
+            );
+        }
+        initialized["capabilities"]["workspace"]["fileOperations"]["didCreate"]["filters"][0]["pattern"]
+            ["options"]["ignoreCase"] = json!(true);
+        for (name, expected) in [("MAIN.RS", true), ("DOMAIN.RS", false)] {
+            assert_eq!(
+                file_operation_registered(
+                    &initialized,
+                    "didCreate",
+                    &json!({
+                        "kind": "create", "uri": format!("file:///workspace/{name}"),
+                        "isDirectory": false
+                    })
+                ),
+                expected,
+                "case-insensitive create {name}"
+            );
+        }
     }
 
     #[test]

@@ -1078,7 +1078,8 @@ fn glob_matches_at(
         if recursive_directory {
             next_pattern += 1;
         }
-        glob_matches_at(pattern, path, next_pattern, path_index, states)
+        ((!recursive_directory || path_index == 0 || path[path_index - 1] == b'/')
+            && glob_matches_at(pattern, path, next_pattern, path_index, states))
             || (path_index < path.len()
                 && (recursive || path[path_index] != b'/')
                 && glob_matches_at(pattern, path, pattern_index, path_index + 1, states))
@@ -1319,7 +1320,7 @@ fn invalid_json_input(
     }
 }
 
-fn merge_partial_results(
+pub(crate) fn merge_partial_results(
     command: QueryCommand,
     mut result: Value,
     partials: Vec<Value>,
@@ -1434,7 +1435,7 @@ fn take_array_or_null(
     }
 }
 
-fn normalize_named_result(
+pub(crate) fn normalize_named_result(
     command: QueryCommand,
     mut result: Value,
 ) -> Result<Value, ContractFailure> {
@@ -2294,6 +2295,85 @@ mod tests {
             .code,
             "capability_unavailable"
         );
+    }
+
+    #[test]
+    fn recursive_glob_respects_directory_boundaries() {
+        for (pattern, path, ignore_case, expected) in [
+            ("**/main.rs", "main.rs", false, true),
+            ("**/main.rs", "/main.rs", false, true),
+            ("**/main.rs", "src/main.rs", false, true),
+            ("**/main.rs", "/workspace/src/main.rs", false, true),
+            ("**/main.rs", "domain.rs", false, false),
+            ("**/main.rs", "/workspace/domain.rs", false, false),
+            ("**/main.rs", "/workspace/main.rs.bak", false, false),
+            ("src/**/main.rs", "src/main.rs", false, true),
+            ("src/**/main.rs", "src/one/two/main.rs", false, true),
+            ("src/**/main.rs", "src/domain.rs", false, false),
+            ("*.rs", "main.rs", false, true),
+            ("*.rs", "src/main.rs", false, false),
+            ("**.rs", "src/main.rs", false, true),
+            ("**main.rs", "src/domain.rs", false, true),
+            ("**/main.{rs,py}", "src/main.py", false, true),
+            ("**/main.{rs,py}", "src/domain.rs", false, false),
+            ("**/main.[r-t][!x]", "src/main.rs", false, true),
+            ("**/main.[!r]s", "src/main.rs", false, false),
+            ("**/MAIN.RS", "src/main.rs", true, true),
+            ("**/MAIN.RS", "src/main.rs", false, false),
+            ("**/MAIN.RS", "src/DOMAIN.RS", true, false),
+        ] {
+            assert_eq!(
+                protocol_glob_matches(pattern, path, ignore_case),
+                expected,
+                "pattern={pattern:?}, path={path:?}, ignore_case={ignore_case}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_glob_document_selectors_reject_filename_suffixes() {
+        let invocation = ParsedInvocation {
+            command: vec!["definition".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        let mut document = document();
+        for pattern in [
+            json!("**/main.rs"),
+            json!({"baseUri": "file:///workspace", "pattern": "**/main.rs"}),
+        ] {
+            let mut capabilities = supported_with_options("definition", json!({}));
+            capabilities
+                .providers
+                .get_mut("definition")
+                .unwrap()
+                .selector =
+                Some(json!([{"language": "rust", "scheme": "file", "pattern": pattern}]));
+            for (name, expected) in [("main.rs", true), ("domain.rs", false)] {
+                document.uri = format!("file:///workspace/{name}");
+                let result = compose(
+                    &invocation,
+                    Some(&document),
+                    PositionEncoding::Utf16,
+                    &capabilities,
+                    None,
+                );
+                if expected {
+                    assert!(result.is_ok(), "{pattern:?}: {name}: {result:?}");
+                } else {
+                    assert_eq!(
+                        result
+                            .expect_err("filename suffix must not admit a Document")
+                            .code,
+                        "capability_unavailable",
+                        "{pattern:?}: {name}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

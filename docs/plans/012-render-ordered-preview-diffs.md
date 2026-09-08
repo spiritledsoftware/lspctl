@@ -6,7 +6,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — six regressions and all acceptance gates pass
 - **Priority:** P2
 - **Effort:** M
 - **Risk:** MED
@@ -188,13 +188,27 @@ The six required tests are the three initial rendering regressions, `ordered_pre
 
 ## Done criteria
 
-- [ ] All six named tests are listed and pass; the original regressions fail before the fix.
-- [ ] Create→edit and rename→edit produce truthful nonempty diffs before any physical Application.
-- [ ] Repeated text operations render against their own virtual before-state, and projected after-bytes equal staged after-bytes.
-- [ ] One shared ordered evaluator powers presentation and staging; no third interpreter exists.
-- [ ] Stale/malformed input cannot fabricate a diff, and rendering does not write Workspace files or transaction artifacts.
-- [ ] Full tests, Clippy, format, schema, fixture, and diff checks exit 0.
-- [ ] Only scoped files changed and index row 012 is updated.
+- [x] All six named tests are listed and pass; the original regressions fail before the fix.
+- [x] Create→edit and rename→edit produce truthful nonempty diffs before any physical Application.
+- [x] Repeated text operations render against their own virtual before-state, and projected after-bytes equal staged after-bytes.
+- [x] One shared ordered evaluator powers presentation and staging; no third interpreter exists.
+- [x] Stale/malformed input cannot fabricate a diff, and rendering does not write Workspace files or transaction artifacts.
+- [x] Full tests, Clippy, format, schema, fixture, and diff checks exit 0.
+- [x] Only scoped files changed; index row 012 is coordinated by the root reviewer.
+
+## Implementation and verification evidence
+
+- Starting HEAD `e83786f` (merged PR #59), initially clean. Reviewed drift from `5268c6a`: prior plans added directory-membership certificates, reservation ownership, and proven commit/rollback effects. These are preserved; the ordered staging interpreter itself still matched this plan's excerpt. No unexplained semantic drift.
+- Initial valid RED: `cargo test --locked --bin lspctl ordered_preview` failed the create/repeated presentation assertions (`None`), and rename→edit failed opening the nonexistent virtual destination at operation 1. Unicode/CRLF WorkspaceEdits compiled and passed validation up to those intended failures. The planner regression independently failed the same missing-source path. Logs: `/tmp/48-render-red.log`, `/tmp/48-planner-red.log`.
+- `ResourceState.text_source` is in-memory only. Physical file inspection initializes it; moved file/directory states retain it; empty creates and tombstones clear it. Lazy reads retain ancestor/no-follow checks and per-Document limits. The required planner test covers file, nested directory, and both chained rename forms, plus deletion non-resurrection and size rejection.
+- `visit_canonical_text_outputs` is the single ordered evaluator shared by staging and presentation. It retains digest checks, virtual text/rename aliases/missing roots, cumulative staged-byte limits, and the existing access-time-preserving reader. The staging sink retains exclusive private output creation, permissions, flushes, and operation-index filenames. The presentation sink emits ordered resource notices and contextual radius-3 hunks without staging artifacts. Canonical byte conversions, ordering, bounds, and UTF-8 boundaries fail rather than panic.
+- Six named `ordered_preview_*` tests pass. Equivalence covers create→edit, rename→edit, repeated edits, directory rename→nested edit, overwrite-create→edit, and delete→create→edit, comparing projected bytes and canonical digests to real staged files. Tests separately assert exact display lines/order, unchanged physical manifests, ownership marker/private Unix permissions, and cumulative staging/display limits. Stale/missing input, malformed ranges/digests, no-ops, and binary-only resource notices are covered without Workspace writes.
+- Scoped GREEN on Linux: discovery lists all **6** required names; `ordered_preview` **6**, `mutation::` **44**, planner **9**, and existing private-staging exemplar **1** pass. Clippy with `-D warnings`, formatting, schema, immutable stored-state, and whitespace checks exit **0**. Logs: `/tmp/48-discovery-green.log`, `/tmp/48-step4.log`, `/tmp/48-mutation.log`, `/tmp/48-planner-all.log`, `/tmp/48-staging.log`, `/tmp/48-clippy.log`, `/tmp/48-format.log`, `/tmp/48-schema.log`, `/tmp/48-state.log`.
+- Root independently reviewed the production and test diffs without blocking findings. Native path audit confirmed these tests share the planner's lexical root/file-URI convention (no Owner snapshot canonicalization mismatch). Windows/macOS/MSRV have not been run locally.
+- Combined full GREEN after #49 completed its intended RED phase: `cargo test --locked --all-targets --features fake-server` passes **152** tests (104 unit + 4 CLI + 3 fake-server fixture + 38 lifecycle + 3 installation), including all six #48 regressions and existing contextual-diff/Mutation coverage. Evidence: `/tmp/49-full-green.log`, independently inspected. Combined Clippy, formatting, schema, immutable stored-state, and whitespace gates also pass.
+- Only the three scoped Mutation files and this plan were changed for #48; the coordinator owns the index. Concurrent #49 changes are separately scoped. Changes remain uncommitted.
+
+- Final coordinator verification after all three plans: **155** tests pass (107 unit + 4 CLI + 3 documentation + 38 lifecycle + 3 installation), exact regression discovery counts **6/2/5/3**, and Clippy, formatting, schema, stored-state, and whitespace gates pass. Logs: `/tmp/48-50-root-full-green.log`, `/tmp/48-50-root-clippy.log`. Independent coordinator review found no blocking findings; the shared index now marks plans 012–014 DONE. Changes remain uncommitted; native Windows/macOS/MSRV CI was not run.
 
 ## STOP conditions
 
