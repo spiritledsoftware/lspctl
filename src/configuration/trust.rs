@@ -155,7 +155,24 @@ pub(crate) fn authorize_server(
 
 fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let configuration = command_configuration(invocation)?;
-    let declarations = current_declarations(&configuration)?;
+    let declarations = if invocation.has_option("--all") {
+        current_declarations(&configuration)?
+    } else {
+        let name = invocation.option_string("--server").unwrap();
+        let server = configuration
+            .servers
+            .get(&name)
+            .filter(|server| !server.project_fields.is_empty())
+            .ok_or_else(|| {
+                super::server_selection_failure(
+                    "The named server has no project-controlled declaration.",
+                )
+            })?;
+        BTreeMap::from([(
+            name.clone(),
+            current_declaration(&configuration, &name, server)?,
+        )])
+    };
     let expected = invocation.option_string("--digest").unwrap();
     let selected = if invocation.has_option("--all") {
         let actual = aggregate_digest(&declarations);
@@ -170,18 +187,7 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
         declarations.values().collect::<Vec<_>>()
     } else {
         let server = invocation.option_string("--server").unwrap();
-        let declaration = declarations.get(&server).ok_or_else(|| {
-            trust_failure(
-                "trust_digest_mismatch",
-                "The named server has no project-controlled declaration.",
-                json!({
-                    "workspaceUri": configuration.workspace_uri,
-                    "server": server,
-                    "expectedDigest": expected,
-                    "actualDigest": aggregate_digest(&declarations)
-                }),
-            )
-        })?;
+        let declaration = &declarations[&server];
         if expected != declaration.digest {
             return Err(digest_mismatch_failure(
                 &configuration,
@@ -191,6 +197,14 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
             ));
         }
         vec![declaration]
+    };
+    // Named grants need only their declaration; optional metadata must remain a full aggregate.
+    let aggregate = if invocation.has_option("--all") {
+        Some(aggregate_digest(&declarations))
+    } else {
+        current_declarations(&configuration)
+            .ok()
+            .map(|declarations| aggregate_digest(&declarations))
     };
     let replace_denial =
         invocation.has_option("--replace-denial") || invocation.has_option("--replace-denials");
@@ -254,7 +268,7 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
     Ok(trust_change_envelope(
         invocation,
         &configuration,
-        Some(aggregate_digest(&declarations)),
+        aggregate,
         selected
             .iter()
             .filter_map(|declaration| {
@@ -312,7 +326,6 @@ fn deny_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
 
 fn revoke_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let configuration = command_configuration(invocation)?;
-    let declarations = current_declarations(&configuration)?;
     let server = invocation.option_string("--server").unwrap();
     let _application_lock = crate::mutation::acquire_workspace_application_lock(
         &configuration.workspace_uri,
@@ -324,15 +337,7 @@ fn revoke_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure>
         });
         Ok(())
     })?;
-    let record = json!({
-        "workspaceUri": configuration.workspace_uri,
-        "server": server,
-        "state": "untrusted",
-        "currentDigest": declarations.get(&server).map(|declaration| &declaration.digest),
-        "changedFields": [],
-        "updatedAt": now_rfc3339(),
-        "requiredCommand": ["trust", "grant"]
-    });
+    let record = render_untrusted_record(&configuration, &server, None);
     let (owners_signalled, owner_signal_failures) = crate::session::signal_workspace_owners(
         &configuration.workspace_uri,
         std::slice::from_ref(&server),
@@ -340,7 +345,7 @@ fn revoke_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure>
     Ok(trust_change_envelope(
         invocation,
         &configuration,
-        Some(aggregate_digest(&declarations)),
+        None,
         vec![record],
         owners_signalled,
         owner_signal_failures,
