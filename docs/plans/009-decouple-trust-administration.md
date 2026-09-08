@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — bounded safety fix; independent named-status success remains deferred
 - **Audit finding:** 9
 - **Priority:** P1
 - **Effort:** M
@@ -203,14 +203,27 @@ Five integration tests cover both newly fixed boundaries and preserved contract 
 
 ## Done criteria
 
-- [ ] Step 1 confirms the required/optional aggregate distinction; the bounded scope is retained without an assumed contract change.
-- [ ] Five `trust_administration_*` tests are discovered and pass for the bounded option.
-- [ ] Revocation removes the persisted record despite missing/incomplete/removed executable declaration and signals the matching Owner.
-- [ ] A named grant ignores unrelated unavailable declarations while exact selected digest and Denial checks remain enforced.
-- [ ] Incomplete declaration errors are structured JSON, not panics; no administration-only test starts a language server.
-- [ ] `--all` digest algorithm, fail-closed behavior, state format, and status aggregate meaning remain unchanged under the bounded option.
-- [ ] Full tests, Clippy, formatting, contract, stored-state, and diff checks pass.
-- [ ] Only allowed files changed; plan/index accurately state whether named-status independence remains deferred. Do not mark the entire audit finding resolved if it does.
+- [x] Step 1 confirms the required/optional aggregate distinction; the bounded scope is retained without an assumed contract change.
+- [x] Five `trust_administration_*` tests are discovered and pass for the bounded option.
+- [x] Revocation removes the persisted record despite missing/incomplete/removed executable declaration and signals the matching Owner.
+- [x] A named grant ignores unrelated unavailable declarations while exact selected digest and Denial checks remain enforced.
+- [x] Incomplete declaration errors are structured JSON, not panics; no administration-only test starts a language server.
+- [x] `--all` digest algorithm, fail-closed behavior, state format, and status aggregate meaning remain unchanged under the bounded option.
+- [x] Full tests, Clippy, formatting, contract, stored-state, and diff checks pass.
+- [x] Only allowed files changed; plan/index accurately state whether named-status independence remains deferred. Do not mark the entire audit finding resolved if it does.
+
+## Completion evidence
+
+- Started from clean merged `main` at `d5ddf93`. Drift from `5268c6a` in scoped files was limited to reviewed lifecycle regressions for partial results, Owner maintenance, and raw Document scope; configuration/Trust implementation and read-only contract assets were unchanged. Baseline: 124 tests passed.
+- Step 1 schema command exited 0: status requires a string `aggregateDigest`; Trust-change metadata may omit it. Retained the bounded schema-compatible decision, without contract or digest changes.
+- Discovered exactly five named integration regressions. Before the fix, named grant/revoke failed on an unavailable sibling; incomplete declarations exited 101 instead of structured exit 3. Healthy aggregate/stale-digest/Denial controls ran before the incomplete-sibling cases failed.
+- The shared executable resolver now returns the existing incomplete-declaration error, reusing a private constructor with selection guards. Its focused integration test and both Trust unit tests passed before proceeding to grant/revoke isolation.
+- Named grants resolve only the selected project-controlled declaration for authorization, then attempt a complete aggregate solely as optional metadata. Missing/user-only selections return the existing `server_selection_failed` contract rather than inventing an aggregate for an absent declaration. Wrong digests and Denial replacement requirements remain enforced.
+- Revocation retains configuration/Workspace validation, lock ordering, durable record removal, and Owner signalling, with no executable resolution. It reuses the untrusted-record renderer and omits unknown current/aggregate digests. Tests read durable state through `trust list`, including repeated revocation and removed declarations, and verify live Owner generations were signalled.
+- Independent review identified a panic-cleanup gap in the live-Owner regression. The existing bounded cleanup guard now accepts a server name and is installed before startup; prior test callers retain `fake`.
+- Final five integration regressions and both Trust unit tests pass. Full locked all-target fake-server suite: 129 passed, including 26 lifecycle tests. Clippy (`-D warnings`), formatting, schema registry, stored-state, and diff checks exited 0 on Linux. Native macOS/Windows verification remains for CI.
+- Changes are limited to the three allowed implementation/test files and this plan/index metadata. No new dependencies, state-format changes, runtime changes, or contract-asset edits. Changes remain uncommitted.
+- **Residual limitation:** named status still requires the complete all-declarations aggregate and fails structurally if a sibling is missing or incomplete. Independent named-status success remains deferred; audit finding 9 is not completely resolved.
 
 ## STOP conditions
 

@@ -3146,6 +3146,8 @@ mod tests {
                 fixture.finished.recv().await.unwrap();
                 assert_eq!(fixture.admission.available_permits(), 4);
 
+                // Pause only in-memory I/O: scheduler delays must not consume the request budget.
+                tokio_time::pause();
                 // A one-byte duplex capacity deterministically blocks the failure response.
                 let (mut peer, mut server) = tokio::io::duplex(1);
                 let permit = Arc::clone(&fixture.admission).try_acquire_owned().unwrap();
@@ -3163,6 +3165,7 @@ mod tests {
                     )
                     .await
                     .expect("failure write restarted or exceeded the handshake deadline");
+                    drop(server);
                     assert!(
                         matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut)
                     );
@@ -3176,6 +3179,7 @@ mod tests {
                     finished_rx.await.unwrap();
                 };
                 tokio::join!(authentication, caller);
+                tokio_time::resume();
                 assert_eq!(fixture.admission.available_permits(), 4);
             }
             fixture.stop().await;

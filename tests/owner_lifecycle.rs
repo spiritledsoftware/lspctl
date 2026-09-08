@@ -103,6 +103,60 @@ impl Fixture {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn project_configuration(&self, declarations: &str) {
+        fs::write(
+            self.workspace.join(".lspctl.toml"),
+            format!("version = 1\n{declarations}"),
+        )
+        .unwrap();
+    }
+
+    fn trust(&self, arguments: &[&str]) -> Value {
+        let mut command = vec!["trust"];
+        command.extend_from_slice(arguments);
+        command.extend(["--workspace", self.workspace.to_str().unwrap()]);
+        let result = self.command(&command);
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["command"], json!(["trust", arguments[0]]));
+        result
+    }
+
+    fn trust_failure(&self, arguments: &[&str], code: &str) -> Value {
+        let mut command = vec!["trust"];
+        command.extend_from_slice(arguments);
+        command.extend(["--workspace", self.workspace.to_str().unwrap()]);
+        let output = self.output(&command);
+        assert_eq!(
+            output.status.code(),
+            Some(if code == "server_executable_unavailable" {
+                4
+            } else {
+                3
+            })
+        );
+        assert!(output.stderr.is_empty());
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schemaVersion"], 1);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], code);
+        assert_eq!(result["error"]["retry"], "after_change");
+        assert!(result.get("result").is_none());
+        result["error"].clone()
+    }
+
+    fn assert_no_sessions(&self) {
+        assert_eq!(
+            self.command(&[
+                "session",
+                "list",
+                "--workspace",
+                self.workspace.to_str().unwrap()
+            ])["result"],
+            json!([])
+        );
+    }
+
     fn stop(&self, workspace: &str) -> Value {
         self.command(&[
             "session",
@@ -135,6 +189,351 @@ impl Fixture {
         }
         command.envs(environment.iter().copied());
         command.output().unwrap()
+    }
+}
+
+fn trust_declaration(name: &str) -> String {
+    format!(
+        "[servers.{name}]\nexecutable = {:?}\n",
+        env!("CARGO_BIN_EXE_lspctl-fake-server")
+    )
+}
+
+fn assert_trust_change(value: &Value, server: &str, state: &str) {
+    let result = &value["result"];
+    assert!(
+        result["workspaceUri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:")
+    );
+    assert!(result["ownersSignalled"].is_array());
+    assert_eq!(result["ownerSignalFailures"], json!([]));
+    assert_eq!(result["records"].as_array().unwrap().len(), 1);
+    let record = &result["records"][0];
+    assert_eq!(record["workspaceUri"], result["workspaceUri"]);
+    assert_eq!(record["server"], server);
+    assert_eq!(record["state"], state);
+    assert!(!record["updatedAt"].as_str().unwrap().is_empty());
+    assert!(record["changedFields"].is_array());
+    assert!(
+        record
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| !value.is_null())
+    );
+}
+
+#[test]
+fn trust_administration_grant_ignores_unrelated_unavailable_server() {
+    for sibling in [
+        "[servers.other]\nexecutable = './absent-server'\n",
+        "[servers.other]\nargs = []\n",
+    ] {
+        let fixture = Fixture::new();
+        let selected = trust_declaration("project");
+        fixture.project_configuration(&selected);
+        let status = fixture.trust(&["status", "--server", "project"]);
+        let digest = status["result"]["records"][0]["currentDigest"]
+            .as_str()
+            .unwrap();
+        fixture.project_configuration(&format!("{selected}{sibling}"));
+
+        for name in ["undeclared", "fake"] {
+            fixture.trust_failure(
+                &["grant", "--server", name, "--digest", digest],
+                "server_selection_failed",
+            );
+            assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+        }
+        let mut wrong = digest.to_owned();
+        wrong.pop();
+        wrong.push(if digest.ends_with('0') { '1' } else { '0' });
+        fixture.trust_failure(
+            &["grant", "--server", "project", "--digest", &wrong],
+            "trust_digest_mismatch",
+        );
+        assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+        let granted = fixture.trust(&["grant", "--server", "project", "--digest", digest]);
+        assert_trust_change(&granted, "project", "trusted");
+        assert!(granted["result"].get("aggregateDigest").is_none());
+        assert_eq!(granted["result"]["ownersSignalled"], json!([]));
+        assert_eq!(granted["result"]["records"][0]["currentDigest"], digest);
+        assert_eq!(granted["result"]["records"][0]["declarationDigest"], digest);
+        let stored = fixture.trust(&["list"]);
+        assert_eq!(stored["result"].as_array().unwrap().len(), 1);
+        assert_eq!(stored["result"][0]["server"], "project");
+        assert_eq!(stored["result"][0]["declarationDigest"], digest);
+        fixture.assert_no_sessions();
+    }
+}
+
+#[test]
+fn trust_administration_revoke_ignores_executable_availability() {
+    for selected in [
+        "[servers.project]\nexecutable = './absent-server'\n",
+        "[servers.project]\nargs = []\n",
+        "",
+    ] {
+        let fixture = Fixture::new();
+        let _cleanup = StopOwnerOnPanic(&fixture, "project");
+        fixture.project_configuration(&trust_declaration("project"));
+        let status = fixture.trust(&["status"]);
+        let digest = status["result"]["records"][0]["currentDigest"]
+            .as_str()
+            .unwrap();
+        fixture.trust(&["grant", "--server", "project", "--digest", digest]);
+        let started = fixture.command(&[
+            "raw",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--server",
+            "project",
+            "--method",
+            "fixture/start",
+        ]);
+        let generation = started["context"]["ownerGeneration"].as_str().unwrap();
+        fixture.project_configuration(&format!("{selected}[servers.missing]\nexecutable = './absent-sibling'\n[servers.z_incomplete]\nargs = []\n"));
+        // Always stop the deliberate Owner before assertions, including on the red path.
+        let output = fixture.output(&[
+            "trust",
+            "revoke",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--server",
+            "project",
+        ]);
+        let listed = fixture.command(&[
+            "session",
+            "list",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+        ]);
+        let _ = fixture.output(&["session", "stop", generation]);
+        assert!(
+            output.status.success(),
+            "revoke failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty());
+        let revoked: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(revoked["schemaVersion"], 1);
+        assert_eq!(revoked["ok"], true);
+        assert_eq!(revoked["command"], json!(["trust", "revoke"]));
+        assert_trust_change(&revoked, "project", "untrusted");
+        assert_eq!(revoked["result"]["ownersSignalled"], json!([generation]));
+        assert_eq!(listed["result"], json!([]));
+        assert!(revoked["result"].get("aggregateDigest").is_none());
+        assert!(
+            revoked["result"]["records"][0]
+                .get("currentDigest")
+                .is_none()
+        );
+        assert_eq!(
+            revoked["result"]["records"][0]["requiredCommand"],
+            json!(["trust", "grant"])
+        );
+        assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+        let repeated = fixture.trust(&["revoke", "--server", "project"]);
+        assert_trust_change(&repeated, "project", "untrusted");
+        assert_eq!(repeated["result"]["ownersSignalled"], json!([]));
+        assert!(repeated["result"].get("aggregateDigest").is_none());
+        assert!(
+            repeated["result"]["records"][0]
+                .get("currentDigest")
+                .is_none()
+        );
+        assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+        fixture.assert_no_sessions();
+    }
+}
+
+#[test]
+fn trust_administration_incomplete_declarations_return_json() {
+    let fixture = Fixture::new();
+    fixture.project_configuration(&trust_declaration("project"));
+    let status = fixture.trust(&["status"]);
+    let digest = status["result"]["records"][0]["currentDigest"]
+        .as_str()
+        .unwrap();
+    for (declaration, code, category, stage) in [
+        (
+            "[servers.project]\nargs = []\n",
+            "server_declaration_incomplete",
+            "blocked",
+            "select_server",
+        ),
+        (
+            "[servers.project]\nexecutable = './absent-server'\n",
+            "server_executable_unavailable",
+            "unavailable",
+            "resolve_executable",
+        ),
+    ] {
+        fixture.project_configuration(declaration);
+        for arguments in [
+            vec!["status", "--server", "project"],
+            vec!["grant", "--server", "project", "--digest", digest],
+        ] {
+            let error = fixture.trust_failure(&arguments, code);
+            assert_eq!(error["category"], category);
+            assert_eq!(error["stage"], stage);
+            assert_eq!(error["delivery"], "not_sent");
+            if code == "server_declaration_incomplete" {
+                assert_eq!(
+                    error["data"],
+                    json!({"server": "project", "missingFields": ["executable"]})
+                );
+            } else {
+                assert_eq!(
+                    error["data"],
+                    json!({"server": "project", "declared": "./absent-server"})
+                );
+            }
+            assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+            fixture.assert_no_sessions();
+        }
+    }
+}
+
+#[test]
+fn trust_administration_preserves_all_grant_digest_and_denials() {
+    let fixture = Fixture::new();
+    let declarations = format!(
+        "{}{}",
+        trust_declaration("project"),
+        trust_declaration("other")
+    );
+    fixture.project_configuration(&declarations);
+    let status = fixture.trust(&["status"]);
+    let aggregate = status["result"]["aggregateDigest"].as_str().unwrap();
+    assert_eq!(status["result"]["records"].as_array().unwrap().len(), 2);
+    let granted = fixture.trust(&["grant", "--all", "--digest", aggregate]);
+    assert_eq!(granted["result"]["aggregateDigest"], aggregate);
+    assert_eq!(granted["result"]["records"].as_array().unwrap().len(), 2);
+    assert!(
+        granted["result"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["state"] == "trusted"
+                && record["declarationDigest"] == record["currentDigest"])
+    );
+    let stored = fixture.trust(&["list"]);
+    assert_eq!(stored["result"].as_array().unwrap().len(), 2);
+
+    fixture.project_configuration(&format!("{declarations}args = ['--changed']\n"));
+    fixture.trust_failure(
+        &["grant", "--all", "--digest", aggregate],
+        "trust_digest_mismatch",
+    );
+    assert_eq!(fixture.trust(&["list"]), stored);
+    fixture.project_configuration(&declarations);
+    fixture.trust(&["deny", "--server", "project"]);
+    let denied = fixture.trust(&["list"]);
+    fixture.trust_failure(
+        &["grant", "--all", "--digest", aggregate],
+        "denial_replacement_required",
+    );
+    assert_eq!(fixture.trust(&["list"]), denied);
+    let project_digest = status["result"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["server"] == "project")
+        .unwrap()["currentDigest"]
+        .as_str()
+        .unwrap();
+    fixture.trust_failure(
+        &["grant", "--server", "project", "--digest", project_digest],
+        "denial_replacement_required",
+    );
+    assert_eq!(fixture.trust(&["list"]), denied);
+    let replaced = fixture.trust(&[
+        "grant",
+        "--server",
+        "project",
+        "--digest",
+        project_digest,
+        "--replace-denial",
+    ]);
+    assert_trust_change(&replaced, "project", "trusted");
+    fixture.trust(&["deny", "--server", "project"]);
+    let replaced_all =
+        fixture.trust(&["grant", "--all", "--digest", aggregate, "--replace-denials"]);
+    assert!(
+        replaced_all["result"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["state"] == "trusted")
+    );
+    let stored = fixture.trust(&["list"]);
+    for (sibling, code) in [
+        (
+            "[servers.missing]\nexecutable = './absent-server'\n",
+            "server_executable_unavailable",
+        ),
+        (
+            "[servers.incomplete]\nargs = []\n",
+            "server_declaration_incomplete",
+        ),
+    ] {
+        fixture.project_configuration(&format!("{declarations}{sibling}"));
+        fixture.trust_failure(
+            &["grant", "--all", "--digest", aggregate, "--replace-denials"],
+            code,
+        );
+        assert_eq!(fixture.trust(&["list"]), stored);
+    }
+    fixture.assert_no_sessions();
+}
+
+#[test]
+fn trust_administration_status_preserves_full_aggregate_contract() {
+    let fixture = Fixture::new();
+    let selected = trust_declaration("project");
+    fixture.project_configuration(&selected);
+    let selected_only = fixture.trust(&["status"]);
+    let declarations = format!("{selected}{}", trust_declaration("other"));
+    fixture.project_configuration(&declarations);
+    let full = fixture.trust(&["status"]);
+    let named = fixture.trust(&["status", "--server", "project"]);
+    let aggregate = named["result"]["aggregateDigest"].as_str().unwrap();
+    assert!(aggregate.starts_with("sha256:"));
+    assert_eq!(aggregate.len(), 71);
+    assert_eq!(
+        named["result"]["aggregateDigest"],
+        full["result"]["aggregateDigest"]
+    );
+    assert_ne!(
+        named["result"]["aggregateDigest"],
+        selected_only["result"]["aggregateDigest"]
+    );
+    assert_eq!(named["result"]["records"].as_array().unwrap().len(), 1);
+    assert_eq!(named["result"]["records"][0]["server"], "project");
+    assert!(
+        named["result"]["workspaceUri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:")
+    );
+    for (sibling, code) in [
+        (
+            "[servers.other]\nexecutable = './absent-server'\n",
+            "server_executable_unavailable",
+        ),
+        (
+            "[servers.other]\nargs = []\n",
+            "server_declaration_incomplete",
+        ),
+    ] {
+        fixture.project_configuration(&format!("{selected}{sibling}"));
+        let error = fixture.trust_failure(&["status", "--server", "project"], code);
+        assert_eq!(error["data"]["server"], "other");
+        assert_eq!(fixture.trust(&["list"])["result"], json!([]));
+        fixture.assert_no_sessions();
     }
 }
 
@@ -510,7 +909,7 @@ fn check_maintenance_under_notifications(disconnect: bool) {
         &["--scenario=notification-flood", &event_argument],
         "[session]\ncancellation_grace = \"250ms\"\n",
     );
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let marker = fixture.workspace.join("flood-ready");
     let stdout = root.path().join("stdout.json");
     let stderr = root.path().join("stderr.log");
@@ -756,7 +1155,7 @@ fn query_failure_preserves_server_error_partial_results_context_and_trace() {
     fixture.stop(workspace);
 }
 
-struct StopOwnerOnPanic<'a>(&'a Fixture);
+struct StopOwnerOnPanic<'a>(&'a Fixture, &'a str);
 
 impl Drop for StopOwnerOnPanic<'_> {
     fn drop(&mut self) {
@@ -768,7 +1167,7 @@ impl Drop for StopOwnerOnPanic<'_> {
                 "session",
                 "stop",
                 "--server",
-                "fake",
+                self.1,
                 "--force",
                 "--workspace",
             ])
@@ -792,7 +1191,7 @@ impl Drop for StopOwnerOnPanic<'_> {
 #[test]
 fn owner_partial_results_chunks_merge_success() {
     let fixture = Fixture::new();
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let workspace = fixture.workspace.to_str().unwrap();
     fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
     let response = fixture.command(&[
@@ -824,7 +1223,7 @@ fn owner_partial_results_chunks_merge_success() {
 #[test]
 fn owner_partial_results_chunk_failure_remains_flat() {
     let fixture = Fixture::new();
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let workspace = fixture.workspace.to_str().unwrap();
     fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
     let output = fixture.output(&[
@@ -867,7 +1266,7 @@ fn owner_partial_results_chunk_failure_remains_flat() {
 #[test]
 fn owner_partial_results_limit_keeps_flat_count() {
     let fixture = Fixture::with_configuration(&[], "[protocol]\nmax_partial_result_bytes = 64\n");
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let workspace = fixture.workspace.to_str().unwrap();
     fs::write(fixture.workspace.join("partial.rs"), "fn partial() {}\n").unwrap();
     let output = fixture.output(&[
@@ -988,7 +1387,7 @@ fn graceful_stop_drains_the_active_query_and_rejects_new_work() {
 #[test]
 fn raw_document_scope_requires_explicit_workspace_and_server() {
     let fixture = Fixture::new();
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let workspace = fixture.workspace.to_str().unwrap();
     fs::write(fixture.workspace.join("inside.rs"), "fn inside() {}\n").unwrap();
     let outside = fixture._root.path().join("outside.rs");
@@ -1044,7 +1443,7 @@ fn raw_document_scope_requires_explicit_workspace_and_server() {
 #[test]
 fn raw_document_scope_allows_in_workspace_documents() {
     let fixture = Fixture::new();
-    let _cleanup = StopOwnerOnPanic(&fixture);
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
     let workspace = fixture.workspace.to_str().unwrap();
     let inside = fixture.workspace.join("inside.rs");
     fs::write(&inside, "fn inside() {}\n").unwrap();
