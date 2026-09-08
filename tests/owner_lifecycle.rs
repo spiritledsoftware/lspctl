@@ -1082,24 +1082,34 @@ struct WriteDispatch {
 
 impl WriteDispatch {
     fn connect(fixture: &Fixture, deadline: Instant) -> Self {
-        fn endpoint_in(directory: &std::path::Path) -> Option<Value> {
+        Self::connect_matching(fixture, None, deadline)
+    }
+
+    fn connect_matching(fixture: &Fixture, context: Option<&Value>, deadline: Instant) -> Self {
+        fn endpoint_in(directory: &std::path::Path, context: Option<&Value>) -> Option<Value> {
             for entry in fs::read_dir(directory).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    if let Some(endpoint) = endpoint_in(&path) {
+                    if let Some(endpoint) = endpoint_in(&path, context) {
                         return Some(endpoint);
                     }
-                } else if directory.ends_with("endpoints")
+                } else if directory.ends_with(std::path::Path::new("owners").join("endpoints"))
                     && path
                         .extension()
                         .is_some_and(|extension| extension == "json")
                 {
-                    return Some(serde_json::from_slice(&fs::read(path).unwrap()).unwrap());
+                    let endpoint: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                    if context.is_none_or(|context| {
+                        endpoint["sessionIdentity"] == context["sessionIdentity"]
+                            && endpoint["ownerGeneration"] == context["ownerGeneration"]
+                    }) {
+                        return Some(endpoint);
+                    }
                 }
             }
             None
         }
-        let endpoint = endpoint_in(fixture._root.path()).expect("fixture Owner endpoint");
+        let endpoint = endpoint_in(fixture._root.path(), context).expect("fixture Owner endpoint");
         let address = endpoint["address"].as_str().unwrap().parse().unwrap();
         let stream = TcpStream::connect_timeout(
             &address,
@@ -1110,17 +1120,24 @@ impl WriteDispatch {
     }
 
     fn send(&mut self, method: &str, params: Value, timeout_ms: u64, deadline: Instant) {
+        self.send_request(
+            json!({
+                "kind": "dispatch", "method": method, "params": params,
+                "refresh_open_documents": false,
+                "raw_request": true, "request_timeout_ms": timeout_ms,
+                "trace_protocol": false, "apply_edits": false
+            }),
+            deadline,
+        );
+    }
+
+    fn send_request(&mut self, request: Value, deadline: Instant) {
         let request = json!({
             "ownerProtocolVersion": self.endpoint["ownerProtocolVersion"],
             "sessionIdentity": self.endpoint["sessionIdentity"],
             "ownerGeneration": self.endpoint["ownerGeneration"],
             "token": self.endpoint["token"],
-            "request": {
-                "kind": "dispatch", "method": method, "params": params,
-                "refresh_open_documents": false,
-                "raw_request": true, "request_timeout_ms": timeout_ms,
-                "trace_protocol": false, "apply_edits": false
-            }
+            "request": request
         });
         let body = serde_json::to_vec(&request).unwrap();
         self.stream
@@ -1139,7 +1156,7 @@ impl WriteDispatch {
         let mut length = [0; 4];
         self.stream
             .read_exact(&mut length)
-            .expect("admitted Dispatch must receive its old-generation failure, not EOF");
+            .expect("admitted request must receive its old-generation response, not EOF");
         let length = u32::from_be_bytes(length) as usize;
         assert!(length < 1024 * 1024, "unexpected fixture response size");
         let mut body = vec![0; length];
@@ -1151,6 +1168,328 @@ impl WriteDispatch {
         );
         response
     }
+}
+
+fn synchronization_raw(
+    fixture: &Fixture,
+    method: &str,
+    params: Value,
+    file: Option<&str>,
+) -> Value {
+    let params = params.to_string();
+    let mut arguments = vec![
+        "raw",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--server",
+        "fake",
+        "--method",
+        method,
+        "--params-json",
+        &params,
+    ];
+    if let Some(file) = file {
+        arguments.extend(["--sync-file", file]);
+    }
+    let result = WriteCaller::spawn(fixture, "synchronization", &arguments)
+        .finish(Instant::now() + Duration::from_secs(5));
+    assert_eq!(result["ok"], true, "{result}");
+    result
+}
+
+fn synchronization_input(path: &std::path::Path, text: &str) -> Value {
+    use sha2::{Digest, Sha256};
+    json!({
+        "path": dunce::canonicalize(path).unwrap(), "languageId": "rust",
+        "expectedDigest": format!("sha256:{}", hex::encode(Sha256::digest(text.as_bytes())))
+    })
+}
+
+fn synchronization_request(fixture: &Fixture, context: &Value, request: Value) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut owner = WriteDispatch::connect_matching(fixture, Some(context), deadline);
+    owner.send_request(request, deadline);
+    owner.finish(deadline)
+}
+
+fn synchronization_stop(fixture: &Fixture) {
+    let response = WriteCaller::spawn(
+        fixture,
+        "synchronization-stop",
+        &[
+            "session",
+            "stop",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--server",
+            "fake",
+        ],
+    )
+    .finish(Instant::now() + Duration::from_secs(5));
+    assert_eq!(response["ok"], true, "{response}");
+}
+
+#[test]
+fn synchronization_retry_after_digest_mismatch_uses_current_text() {
+    for (opened, dispatch) in [(false, false), (true, false), (false, true), (true, true)] {
+        let log_root = TempDir::new().unwrap();
+        let log = log_root.path().join("events");
+        let fixture = Fixture::with_server_arguments(&[&format!("--event-log={}", log.display())]);
+        let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+        let path = fixture.workspace.join("retry.rs");
+        fs::write(&path, "old text\n").unwrap();
+        let uri = url::Url::from_file_path(dunce::canonicalize(&path).unwrap())
+            .unwrap()
+            .to_string();
+        let started = synchronization_raw(
+            &fixture,
+            "test/document-text",
+            json!({"uri": uri}),
+            opened.then_some("retry.rs"),
+        );
+        let context = &started["context"];
+        assert_eq!(
+            started["result"],
+            if opened {
+                json!("old text\n")
+            } else {
+                Value::Null
+            }
+        );
+
+        let current = "new text\n";
+        fs::write(&path, current).unwrap();
+        let document = synchronization_input(&path, "old text\n");
+        let stale_method = "fixture/stale-synchronization-query";
+        let request = if dispatch {
+            json!({
+                "kind": "dispatch", "method": stale_method, "params": {},
+                "documents": [document], "refresh_open_documents": false,
+                "raw_request": true, "request_timeout_ms": 2000,
+                "trace_protocol": false, "apply_edits": false
+            })
+        } else {
+            json!({"kind": "diagnostics", "documents": [document]})
+        };
+        let rejected = synchronization_request(&fixture, context, request);
+        assert_eq!(rejected["ok"], false, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "document_changed_while_reading");
+        assert_eq!(rejected["error"]["stage"], "synchronize");
+        assert_eq!(rejected["error"]["delivery"], "not_sent");
+        assert_eq!(rejected["error"]["retry"], "safe");
+
+        // This normal CLI Query is also a barrier for the fake server's flushed method log.
+        let retry = synchronization_raw(
+            &fixture,
+            "test/document-text",
+            json!({"uri": uri}),
+            Some("retry.rs"),
+        );
+        assert_eq!(
+            retry["context"]["ownerGeneration"],
+            context["ownerGeneration"]
+        );
+        assert_eq!(
+            retry["result"], current,
+            "retry must see delivered text (previously opened: {opened})"
+        );
+        assert!(
+            !fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .any(|method| method == stale_method)
+        );
+        synchronization_stop(&fixture);
+    }
+
+    // Even pre-write rejection leaves committed Document state inconsistent with the server.
+    for opened in [false, true] {
+        let fixture = Fixture::with_configuration(&[], "[protocol]\nmax_message_bytes = 16384\n");
+        let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+        let path = fixture.workspace.join("retry.rs");
+        fs::write(&path, "old text\n").unwrap();
+        let uri = url::Url::from_file_path(dunce::canonicalize(&path).unwrap())
+            .unwrap()
+            .to_string();
+        let started = synchronization_raw(
+            &fixture,
+            "test/document-text",
+            json!({"uri": uri}),
+            opened.then_some("retry.rs"),
+        );
+        fs::write(&path, "x".repeat(32768)).unwrap();
+        let rejected = synchronization_request(
+            &fixture,
+            &started["context"],
+            json!({"kind": "diagnostics", "documents": [synchronization_input(&path, "old text\n")]}),
+        );
+        assert_eq!(rejected["ok"], false, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "owner_unavailable");
+        assert_eq!(rejected["error"]["stage"], "synchronize");
+        assert_eq!(rejected["error"]["delivery"], "uncertain");
+        assert_eq!(rejected["error"]["retry"], "unsafe");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let sessions = WriteCaller::spawn(
+                &fixture,
+                "rejected-sync-sessions",
+                &[
+                    "session",
+                    "list",
+                    "--workspace",
+                    fixture.workspace.to_str().unwrap(),
+                ],
+            )
+            .finish(Instant::now() + Duration::from_secs(5));
+            if sessions["result"] == json!([]) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rejected synchronization left its Owner reusable"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        fs::write(&path, "small retry\n").unwrap();
+        let retry = synchronization_raw(
+            &fixture,
+            "test/document-text",
+            json!({"uri": uri}),
+            Some("retry.rs"),
+        );
+        assert_eq!(retry["result"], "small retry\n");
+        assert_ne!(
+            retry["context"]["ownerGeneration"],
+            started["context"]["ownerGeneration"]
+        );
+        synchronization_stop(&fixture);
+    }
+}
+
+#[test]
+fn synchronization_retry_after_failed_read_closes_old_document() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    #[cfg(not(unix))]
+    let path = fixture.workspace.join("retry.rs");
+    // Exercise aliased temporary paths on Linux too, not just macOS /var or Windows paths.
+    #[cfg(unix)]
+    let path = {
+        let alias = fixture._root.path().join("workspace-alias");
+        std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+        alias.join("retry.rs")
+    };
+    fs::write(&path, "old text\n").unwrap();
+    let uri = url::Url::from_file_path(dunce::canonicalize(&path).unwrap())
+        .unwrap()
+        .to_string();
+    let started = synchronization_raw(
+        &fixture,
+        "test/document-text",
+        json!({"uri": uri}),
+        Some("retry.rs"),
+    );
+    assert_eq!(started["result"], "old text\n");
+    // Like the CLI, snapshot the canonical input before the Owner observes the deletion.
+    let document = synchronization_input(&path, "old text\n");
+    fs::remove_file(&path).unwrap();
+    let rejected = synchronization_request(
+        &fixture,
+        &started["context"],
+        json!({
+            "kind": "diagnostics", "documents": [document]
+        }),
+    );
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"]["code"], "document_read_failed");
+    let closed = synchronization_raw(&fixture, "test/open-documents", json!({}), None);
+    assert_eq!(
+        closed["context"]["ownerGeneration"],
+        started["context"]["ownerGeneration"]
+    );
+    assert_eq!(closed["result"], json!({"count": 0, "uris": []}));
+    fs::write(&path, "recreated text\n").unwrap();
+    let retry = synchronization_raw(
+        &fixture,
+        "test/document-text",
+        json!({"uri": uri}),
+        Some("retry.rs"),
+    );
+    assert_eq!(retry["result"], "recreated text\n");
+    assert_eq!(
+        retry["context"]["ownerGeneration"],
+        started["context"]["ownerGeneration"]
+    );
+    synchronization_stop(&fixture);
+}
+
+#[test]
+fn synchronization_retry_after_postresponse_read_failure_closes_document() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture, "fake");
+    let path = fixture.workspace.join("retry.rs");
+    fs::write(&path, "old text\n").unwrap();
+    let uri = url::Url::from_file_path(dunce::canonicalize(&path).unwrap())
+        .unwrap()
+        .to_string();
+    let started = synchronization_raw(
+        &fixture,
+        "test/document-text",
+        json!({"uri": uri}),
+        Some("retry.rs"),
+    );
+    assert_eq!(started["result"], "old text\n");
+    let marker = fixture._root.path().join("postresponse-ready");
+    let release = marker.with_extension("resume");
+    let _release = ReleaseWriteGateOnDrop(marker.clone());
+    let params = json!({"marker": marker, "releaseMarker": release}).to_string();
+    let mut caller = WriteCaller::spawn(
+        &fixture,
+        "postresponse",
+        &[
+            "raw",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--server",
+            "fake",
+            "--method",
+            "test/await-file-change",
+            "--params-json",
+            &params,
+            "--sync-file",
+            "retry.rs",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_write_marker(&marker, deadline);
+    fs::remove_file(&path).unwrap();
+    fs::write(&release, "release").unwrap();
+    let rejected = caller.finish(deadline);
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "document_read_failed");
+    assert_eq!(
+        rejected["context"]["ownerGeneration"],
+        started["context"]["ownerGeneration"]
+    );
+    let closed = synchronization_raw(&fixture, "test/open-documents", json!({}), None);
+    assert_eq!(
+        closed["context"]["ownerGeneration"],
+        started["context"]["ownerGeneration"]
+    );
+    assert_eq!(closed["result"], json!({"count": 0, "uris": []}));
+    fs::write(&path, "recreated after response\n").unwrap();
+    let retry = synchronization_raw(
+        &fixture,
+        "test/document-text",
+        json!({"uri": uri}),
+        Some("retry.rs"),
+    );
+    assert_eq!(retry["result"], "recreated after response\n");
+    assert_eq!(
+        retry["context"]["ownerGeneration"],
+        started["context"]["ownerGeneration"]
+    );
+    synchronization_stop(&fixture);
 }
 
 struct ReleaseWriteGateOnDrop(PathBuf);

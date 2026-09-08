@@ -1,7 +1,7 @@
 //! Independently framed deterministic LSP fixture for acceptance tests.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     env,
     fs::File,
     io::{self, BufRead, BufReader, Write},
@@ -101,7 +101,7 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
     let mut delayed = None;
     let mut workspace_uri = None;
     let mut partial_limit_request = None;
-    let mut open_documents = BTreeSet::new();
+    let mut open_documents = BTreeMap::new();
     loop {
         let message = match read_frame(&mut input) {
             Ok(Some(message)) => message,
@@ -603,11 +603,17 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 if result(
                     &mut output,
                     &message,
-                    json!({"count": open_documents.len(), "uris": open_documents}),
+                    json!({"count": open_documents.len(), "uris": open_documents.keys().collect::<Vec<_>>()}),
                     scenario,
                 )
                 .is_err()
                 {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/document-text") => {
+                let uri = message.pointer("/params/uri").and_then(Value::as_str).unwrap_or("");
+                if result(&mut output, &message, json!(open_documents.get(uri)), scenario).is_err() {
                     return ExitCode::from(1);
                 }
             }
@@ -646,12 +652,22 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 if marker.is_none_or(|marker| std::fs::write(marker, b"ready\n").is_err()) {
                     return ExitCode::from(1);
                 }
-                let sleep_ms = message
-                    .pointer("/params/sleepMs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(100)
-                    .min(5_000);
-                thread::sleep(Duration::from_millis(sleep_ms));
+                if let Some(release) = message.pointer("/params/releaseMarker").and_then(Value::as_str) {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !std::path::Path::new(release).is_file() {
+                        if Instant::now() >= deadline {
+                            return ExitCode::from(1);
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                } else {
+                    let sleep_ms = message
+                        .pointer("/params/sleepMs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(100)
+                        .min(5_000);
+                    thread::sleep(Duration::from_millis(sleep_ms));
+                }
                 if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
                     return ExitCode::from(1);
                 }
@@ -801,7 +817,7 @@ fn notification_flood(
     }
 }
 
-fn update_open_documents(message: &Value, open_documents: &mut BTreeSet<String>) {
+fn update_open_documents(message: &Value, open_documents: &mut BTreeMap<String, String>) {
     let Some(uri) = message
         .pointer("/params/textDocument/uri")
         .and_then(Value::as_str)
@@ -810,7 +826,12 @@ fn update_open_documents(message: &Value, open_documents: &mut BTreeSet<String>)
     };
     match message.get("method").and_then(Value::as_str) {
         Some("textDocument/didOpen") => {
-            open_documents.insert(uri.to_owned());
+            if let Some(text) = message
+                .pointer("/params/textDocument/text")
+                .and_then(Value::as_str)
+            {
+                open_documents.insert(uri.to_owned(), text.to_owned());
+            }
         }
         Some("textDocument/didClose") => {
             open_documents.remove(uri);
@@ -821,7 +842,7 @@ fn update_open_documents(message: &Value, open_documents: &mut BTreeSet<String>)
 
 fn read_callback_result<R: BufRead>(
     input: &mut R,
-    open_documents: &mut BTreeSet<String>,
+    open_documents: &mut BTreeMap<String, String>,
     callback_id: &Value,
 ) -> Option<Value> {
     loop {
@@ -835,7 +856,7 @@ fn read_callback_result<R: BufRead>(
 
 fn read_callback_message<R: BufRead>(
     input: &mut R,
-    open_documents: &mut BTreeSet<String>,
+    open_documents: &mut BTreeMap<String, String>,
 ) -> Option<Value> {
     loop {
         let message = read_frame(input).ok().flatten()?;
