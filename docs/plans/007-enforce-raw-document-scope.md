@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Audit finding:** 7
 - **Priority:** P1
 - **Effort:** S
@@ -152,12 +152,21 @@ Two table-driven integration tests are sufficient. They cover all explicit-selec
 
 ## Done criteria
 
-- [ ] The discovery assertion exits 0 with exactly two `raw_document_scope_*` tests.
-- [ ] Both tests pass, including the previously accepted external raw Query with inferred server now being denied.
-- [ ] Ordinary external reads remain allowed when both flags are explicit; inside-Workspace inferred reads still work.
-- [ ] Full test suite, Clippy, formatting, schema check, and `git diff --check` exit 0.
-- [ ] No out-of-scope implementation files changed and no test-created Owner remains running.
-- [ ] This plan's status and index row are updated.
+- [x] The discovery assertion exits 0 with exactly two `raw_document_scope_*` tests.
+- [x] Both tests pass, including the previously accepted external raw Query with inferred server now being denied.
+- [x] Ordinary external reads remain allowed when both flags are explicit; inside-Workspace inferred reads still work.
+- [x] Full test suite, Clippy, formatting, schema check, and `git diff --check` exit 0.
+- [x] No out-of-scope implementation files changed and no test-created Owner remains running.
+- [x] This plan's status and index row are updated.
+
+## Completion evidence
+
+- Initial worktree was clean. Drift from `5268c6a` was confined to lifecycle tests and helpers from completed plans 004 and 005; invocation selection and dispatch were unchanged.
+- Discovery assertion exited 0 with exactly the two specified tests. Before the fix, the outside raw Query with explicit Workspace and inferred server returned exit 0 instead of 3; the ordinary selection matrix and inside-Workspace controls passed.
+- After the fix, both regression tests passed and the lifecycle suite passed all 21 tests. Each matrix case stops its Owner, verifies an empty Session list, and retains panic cleanup.
+- `cargo test --locked --all-targets --features fake-server`: 120 tests passed.
+- `cargo clippy --locked --all-targets --features fake-server -- -D warnings`, `cargo fmt --all -- --check`, `python scripts/release/check_schema.py`, and `git diff --check`: all exited 0.
+- Only the two permitted implementation files and this plan/index metadata changed. Changes remain uncommitted. Verification ran on Linux; native macOS/Windows verification remains for CI.
 
 ## STOP conditions
 

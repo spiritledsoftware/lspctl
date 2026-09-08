@@ -118,6 +118,15 @@ impl Fixture {
         self.output_with_environment(arguments, &[])
     }
 
+    fn output_in_workspace(&self, arguments: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lspctl"))
+            .args(arguments)
+            .current_dir(&self.workspace)
+            .envs(self.environment.iter().cloned())
+            .output()
+            .unwrap()
+    }
+
     fn output_with_environment(&self, arguments: &[&str], environment: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lspctl"));
         command.args(arguments);
@@ -974,6 +983,93 @@ fn graceful_stop_drains_the_active_query_and_rejects_new_work() {
         assert_eq!(stopped["result"]["outcome"], "stopped");
         assert!(stop_started.elapsed() >= std::time::Duration::from_millis(300));
     });
+}
+
+#[test]
+fn raw_document_scope_requires_explicit_workspace_and_server() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let workspace = fixture.workspace.to_str().unwrap();
+    fs::write(fixture.workspace.join("inside.rs"), "fn inside() {}\n").unwrap();
+    let outside = fixture._root.path().join("outside.rs");
+    fs::write(&outside, "fn outside() {}\n").unwrap();
+    let outside = outside.to_str().unwrap();
+
+    for query in [
+        vec!["hover", "--file", outside, "--line", "0", "--column", "0"],
+        vec!["raw", "--method", "fixture/scope", "--sync-file", outside],
+    ] {
+        for explicit_workspace in [false, true] {
+            for explicit_server in [false, true] {
+                let mut arguments = query.clone();
+                if explicit_workspace {
+                    arguments.extend(["--workspace", workspace]);
+                }
+                if explicit_server {
+                    arguments.extend(["--server", "fake"]);
+                }
+                let output = fixture.output_in_workspace(&arguments);
+                // Scope denial happens after startup; stop the Owner even for rejected Queries.
+                fixture.stop(workspace);
+                assert_eq!(
+                    fixture.command(&["session", "list", "--workspace", workspace])["result"],
+                    json!([])
+                );
+                assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+                let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                if explicit_workspace && explicit_server {
+                    assert!(output.status.success(), "{arguments:?}: {response}");
+                    assert_eq!(
+                        response["context"]["workspaceUri"],
+                        url::Url::from_directory_path(
+                            dunce::canonicalize(&fixture.workspace).unwrap()
+                        )
+                        .unwrap()
+                        .to_string()
+                    );
+                } else {
+                    assert_eq!(output.status.code(), Some(3), "{arguments:?}: {response}");
+                    assert_eq!(response["error"]["code"], "workspace_selection_failed");
+                    assert_eq!(response["error"]["delivery"], "not_sent");
+                    assert_eq!(
+                        response["error"]["data"]["reason"],
+                        "An outside-Workspace Document requires explicit Workspace and server selection."
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_document_scope_allows_in_workspace_documents() {
+    let fixture = Fixture::new();
+    let _cleanup = StopOwnerOnPanic(&fixture);
+    let workspace = fixture.workspace.to_str().unwrap();
+    let inside = fixture.workspace.join("inside.rs");
+    fs::write(&inside, "fn inside() {}\n").unwrap();
+    let inside = inside.to_str().unwrap();
+
+    for arguments in [
+        vec!["raw", "--method", "fixture/scope", "--sync-file", inside],
+        vec!["hover", "--file", inside, "--line", "0", "--column", "0"],
+    ] {
+        let output = fixture.output_in_workspace(&arguments);
+        fixture.stop(workspace);
+        assert_eq!(
+            fixture.command(&["session", "list", "--workspace", workspace])["result"],
+            json!([])
+        );
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{arguments:?}: {response}");
+        assert_eq!(
+            response["context"]["workspaceUri"],
+            url::Url::from_directory_path(dunce::canonicalize(&fixture.workspace).unwrap())
+                .unwrap()
+                .to_string()
+        );
+    }
 }
 
 #[test]
