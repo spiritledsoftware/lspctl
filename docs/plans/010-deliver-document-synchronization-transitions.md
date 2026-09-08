@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE — three regressions, 139 tests, and all acceptance gates pass
 - **Finding:** Audit #10
 - **Priority:** P1
 - **Effort:** M
@@ -163,13 +163,48 @@ Use `Fixture` in `tests/owner_lifecycle.rs`, not a mocked DocumentStore alone. A
 
 ## Done criteria
 
-- [ ] All three explicitly named tests are discovered and pass; their assertions cover all subcases above.
-- [ ] Complete test/build, Clippy, format, schema, stored-state, and whitespace commands exit 0.
-- [ ] A digest mismatch still prevents the semantic Query from being sent.
-- [ ] Regression evidence proves the next Query sees delivered new text rather than merely updated cache state.
-- [ ] Existing FIFO, raw staleness, and graceful close-before-shutdown tests pass.
-- [ ] No changes outside implementation scope and metadata exception; no leftover fixture Owner.
-- [ ] Status/evidence recorded here and in `docs/plans/README.md`.
+- [x] All three explicitly named tests are discovered and pass; their assertions cover all subcases above.
+- [x] Complete test/build, Clippy, format, schema, stored-state, and whitespace commands exit 0.
+- [x] A digest mismatch still prevents the semantic Query from being sent.
+- [x] Regression evidence proves the next Query sees delivered new text rather than merely updated cache state.
+- [x] Existing FIFO, raw staleness, and graceful close-before-shutdown tests pass.
+- [x] No changes outside implementation scope and metadata exception; no leftover fixture Owner.
+- [x] Status/evidence recorded here and in `docs/plans/README.md`.
+
+## Completion evidence
+
+Issue #47 began on `advisor/010-deliver-document-synchronization-transitions` at clean `814cb18` (merged #58). Issue #46 was confirmed closed. The required drift review from `5268c6a` found no changes to `workspace.rs` or `owner_protocol.rs`; plans 004/005/007/008/009/011 explain the runtime, routing, and fixture changes. The landed 011 transport diff was read, preserving its absolute deadlines, cancellation-safe writer poisoning, maintenance priority, and fatal generation cleanup. The endpoint layout and authenticated request definitions still match the specified private fixture seam. Baseline full tests passed **136** (`/tmp/47-baseline.log`).
+
+### Regression evidence
+
+- Discovery lists exactly the three specified `synchronization_retry` tests. Initial runnable RED (`/tmp/47-synchronization-red.log`) reached the intended assertions: a retry observed `null` instead of `"new text\\n"`, and both explicit and post-response failed reads left fake-server open-Document count **1** instead of **0**. Authentication, digest mismatch, and read-failure assertions passed first. One earlier fixture argument typo (`--params` rather than `--params-json`) was corrected before this intended RED; it was not counted as regression evidence.
+- The digest test covers all four Diagnostics/Dispatch × unopened/reopened combinations, remembered `didOpen` text, same Owner generation, exact safe mismatch metadata, and stale semantic-method suppression before a flushed barrier Query. The two failed-read tests verify close delivery without another synchronization, then recreate/synchronize and observe current text on the same generation. Post-response deletion uses an optional bounded marker/release mode; existing fixed-delay callers are unchanged.
+- The audit also exposed reachable local frame-size rejection: Document limits are independent of frame limits. Rejecting `didOpen` before output leaves a reusable byte stream but an inconsistent committed DocumentStore. Within the existing digest test, first-open and reopen subcases use a 16 KiB frame limit and 32 KiB Document. RED (`/tmp/47-validation-red.log`) explicitly reported `rejected synchronization left its Owner reusable`. The final implementation retires that session through the existing fatal state/process cleanup, without changing low-level pre-write validation semantics. The subcases assert uncertain/unsafe synchronization error precedence over the digest error, retirement, and delivered text on a fresh healthy generation.
+- All three regressions pass, including **five** consecutive focused repetitions (**15/15** tests). The original low-level `frame_write_validation_error_preserves_stream` test remains green. Independent root review found no blocking correctness or scope issue.
+
+### Refresh/event caller audit
+
+| Caller | Event/error handling verified |
+| --- | --- |
+| `synchronize_documents` (Diagnostics and pre-dispatch) | Send every successful refresh outcome before comparing its digest; failed refresh drains pending closes before returning its original error. Notification failure takes precedence. A stale semantic Query still returns before construction/send. |
+| `validate_documents_after_query` | Send successful events regardless of digest comparison; drain failed-read closes before returning. Preserve named-query validation errors and raw-query `postResponseChanged` metadata. |
+| `refresh_open_documents_best_effort` | Send collected outcomes and pending closes; a failed send retains fatal state and `start_dispatch` cannot continue. No retry of an uncertain batch. |
+| Owner `RefreshDocuments` | Existing outcome and pending-event batches are delivered under the single standalone deadline; caught failures cannot preserve the generation. |
+| `synchronize_documents_after_commit` | Evaluate pending-close delivery before combining success flags: a read failure must not short-circuit away already-drained closes. Existing committed Mutation/Receipt results remain intact. |
+| `graceful_shutdown` | Existing pending closes plus `close_all` remain ordered before shutdown under one budget; an already-fatal session is terminated without further frames. |
+| `send_synchronization_events` and shared writer | Any undelivered committed transition records the existing fatal state and terminates the server. The common frame writer rejects subsequent writes; end-loop retirement and response-flush guards cover both fatal cache divergence and the original non-reusable-writer condition. |
+
+No DocumentStore abstraction, watcher, schema, configuration setting, dependency, or protocol command was added. All refresh sites were inspected; the production delta is confined to `owner_runtime.rs`.
+
+### Final gates
+
+- `cargo test --locked --features fake-server --test owner_lifecycle synchronization_retry -- --list`: exactly **3** names.
+- Targeted regressions, the FIFO/raw-staleness test, and graceful close-before-shutdown test: pass.
+- `cargo test --locked --all-targets --features fake-server`: **139** passed (96 unit + 4 CLI + 3 documentation + 33 lifecycle + 3 installation), including all landed 011/005 regressions; `/tmp/47-full-green.log`.
+- Clippy `--all-targets --features fake-server -- -D warnings`, format check, schema check, stored-state check, and `git diff --check`: all exit **0**.
+- Scope inspection lists only the three allowed implementation files and this plan/index metadata; no untracked files or observed leftover fixture Owner/server process. Verified locally on Linux Rust **1.98.1**; native Windows/macOS and MSRV 1.89 were not run locally.
+
+Changes remain **uncommitted** for operator review; no push or PR was made.
 
 ## STOP conditions
 

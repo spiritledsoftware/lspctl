@@ -410,7 +410,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             ),
                         };
                         let _ = pending.response.send(response);
-                        if !lsp.writer.is_reusable() {
+                        if lsp.fatal_transport_failure.is_some() || !lsp.writer.is_reusable() {
                             wait_for_owner_response_flush(pending.delivered).await;
                         }
                     }
@@ -447,7 +447,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             "delivered": file_operations_delivered && !delivery_failed && failures.is_empty()
                         });
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
-                        if !lsp.writer.is_reusable() {
+                        if lsp.fatal_transport_failure.is_some() || !lsp.writer.is_reusable() {
                             wait_for_owner_response_flush(pending.delivered).await;
                         }
                     }
@@ -560,7 +560,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
             }
         }
         // The failure survives best-effort callers and is checked before any further dispatch.
-        if !lsp.writer.is_reusable() {
+        if lsp.fatal_transport_failure.is_some() || !lsp.writer.is_reusable() {
             draining.store(true, Ordering::Release);
             listener_task.abort();
             let failure = lsp.fatal_transport_failure.clone().unwrap_or_else(|| {
@@ -927,7 +927,7 @@ impl LspRuntime {
                 owner_generation,
                 contract_failure_value(failure),
             ));
-            if !self.writer.is_reusable() {
+            if self.fatal_transport_failure.is_some() || !self.writer.is_reusable() {
                 wait_for_owner_response_flush(delivered).await;
             }
             return;
@@ -959,7 +959,7 @@ impl LspRuntime {
             let mut failure = transport_failure(&error);
             attach_trace(&mut failure, trace);
             let _ = response.send(OwnerResponse::failure(owner_generation, failure));
-            if !self.writer.is_reusable() {
+            if self.fatal_transport_failure.is_some() || !self.writer.is_reusable() {
                 wait_for_owner_response_flush(delivered).await;
             }
             return;
@@ -1592,12 +1592,11 @@ impl LspRuntime {
                 .is_ok();
         }
         let pending_events = self.documents.drain_pending_events();
-        file_operations_delivered
-            && synchronized
-            && self
-                .send_synchronization_events(pending_events, deadline)
-                .await
-                .is_ok()
+        let pending_delivered = self
+            .send_synchronization_events(pending_events, deadline)
+            .await
+            .is_ok();
+        file_operations_delivered && synchronized && pending_delivered
     }
 
     async fn maintain_active_queries(
@@ -1677,11 +1676,21 @@ impl LspRuntime {
         deadline: TokioInstant,
     ) -> Result<(), ContractFailure> {
         for document in documents {
-            let outcome = self.documents.refresh(
+            let outcome = match self.documents.refresh(
                 &document.path,
                 &document.language_id,
                 self.negotiated.text_synchronization,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    let pending_events = self.documents.drain_pending_events();
+                    self.send_synchronization_events(pending_events, deadline)
+                        .await?;
+                    return Err(failure);
+                }
+            };
+            self.send_synchronization_events(outcome.events, deadline)
+                .await?;
             if outcome.snapshot.digest != document.expected_digest {
                 return Err(ContractFailure {
                     exit_code: 5,
@@ -1698,8 +1707,6 @@ impl LspRuntime {
                     }),
                 });
             }
-            self.send_synchronization_events(outcome.events, deadline)
-                .await?;
         }
         Ok(())
     }
@@ -1803,14 +1810,22 @@ impl LspRuntime {
     ) -> Result<Vec<Value>, ContractFailure> {
         let mut changed = Vec::new();
         for document in documents {
-            let outcome = self.documents.refresh(
+            let outcome = match self.documents.refresh(
                 &document.path,
                 &document.language_id,
                 self.negotiated.text_synchronization,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    let pending_events = self.documents.drain_pending_events();
+                    self.send_synchronization_events(pending_events, deadline)
+                        .await?;
+                    return Err(failure);
+                }
+            };
+            self.send_synchronization_events(outcome.events, deadline)
+                .await?;
             if outcome.snapshot.digest != document.expected_digest {
-                self.send_synchronization_events(outcome.events, deadline)
-                    .await?;
                 if raw_request {
                     changed.push(json!({
                         "uri": outcome.snapshot.uri,
@@ -1867,9 +1882,13 @@ impl LspRuntime {
                     })
                 }
             };
-            self.write_lsp_message(&notification, false, deadline)
-                .await
-                .map_err(|error| ContractFailure {
+            if let Err(error) = self.write_lsp_message(&notification, false, deadline).await {
+                // Even pre-write rejection leaves committed Documents divergent, though the
+                // byte stream itself is reusable. Retire through the existing fatal path.
+                self.fatal_transport_failure
+                    .get_or_insert_with(|| transport_failure(&error));
+                self.process.terminate_process_tree(Duration::ZERO).await;
+                return Err(ContractFailure {
                     exit_code: 4,
                     category: "unavailable",
                     code: "owner_unavailable",
@@ -1878,7 +1897,8 @@ impl LspRuntime {
                     delivery: "uncertain",
                     retry: "unsafe",
                     data: json!({"reason": error.to_string()}),
-                })?;
+                });
+            }
         }
         Ok(())
     }
@@ -2088,7 +2108,7 @@ impl LspRuntime {
 
     async fn graceful_shutdown(&mut self) {
         let deadline = TokioInstant::now() + self.shutdown_timeout;
-        if !self.writer.is_reusable() {
+        if self.fatal_transport_failure.is_some() || !self.writer.is_reusable() {
             self.process.terminate_process_tree(Duration::ZERO).await;
             return;
         }
@@ -2118,7 +2138,7 @@ impl LspRuntime {
             );
         }
 
-        if !self.writer.is_reusable() {
+        if self.fatal_transport_failure.is_some() || !self.writer.is_reusable() {
             return;
         }
         let id = self.next_request_id;
@@ -2177,7 +2197,7 @@ impl LspRuntime {
                     }
                 }
             }
-            if self.writer.is_reusable() {
+            if self.fatal_transport_failure.is_none() && self.writer.is_reusable() {
                 let _ = self
                     .write_lsp_message(
                         &json!({"jsonrpc": "2.0", "method": "exit"}),
@@ -2200,6 +2220,12 @@ impl LspRuntime {
         message: &Value,
         deadline: TokioInstant,
     ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        if self.fatal_transport_failure.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "The language-server session is no longer synchronized or writable",
+            ));
+        }
         let result = self
             .writer
             .write_json_rpc_frame_with_bytes(message, deadline)
