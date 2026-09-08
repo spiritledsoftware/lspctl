@@ -8,25 +8,26 @@ import json
 from pathlib import Path, PurePath
 
 
-ROOT = Path(__file__).resolve().parents[2] / "tests/fixtures/stored-state/v1"
+ROOT = Path(__file__).resolve().parents[2] / "tests/fixtures/stored-state"
 REQUIRED = {"trust.json", "preview.json", "receipt.json", "recovery.json"}
 
 
-def main() -> None:
-    manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+def check_seed(directory: str, release: str, first_release: bool) -> None:
+    root = ROOT / directory
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if set(manifest) != {"formatVersion", "release", "firstRelease", "files"}:
         raise SystemExit("stored-state manifest has unexpected fields")
-    if manifest["formatVersion"] != 1 or manifest["release"] != "0.1.0":
+    if manifest["formatVersion"] != 1 or manifest["release"] != release:
         raise SystemExit("stored-state manifest identity is invalid")
-    if manifest["firstRelease"] is not True or not isinstance(manifest["files"], list):
-        raise SystemExit("stored-state manifest is not a first-release seed")
+    if manifest["firstRelease"] is not first_release or not isinstance(manifest["files"], list):
+        raise SystemExit("stored-state manifest release metadata is invalid")
 
     names: set[str] = set()
     for record in manifest["files"]:
         if set(record) != {"path", "sha256"} or not isinstance(record["path"], str):
             raise SystemExit("stored-state file entry is invalid")
         relative = PurePath(record["path"])
-        path = ROOT / record["path"]
+        path = root / record["path"]
         if (
             relative.is_absolute()
             or len(relative.parts) != 1
@@ -44,6 +45,11 @@ def main() -> None:
             raise SystemExit(f"stored-state fixture version is invalid: {path.name}")
     if names != REQUIRED:
         raise SystemExit(f"stored-state seed is incomplete: {names!r}")
+
+
+def main() -> None:
+    check_seed("v1", "0.1.0", True)
+    check_seed("v0.1.1", "0.1.1", False)
 
 
 if __name__ == "__main__":

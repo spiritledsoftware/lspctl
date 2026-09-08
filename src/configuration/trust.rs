@@ -851,13 +851,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_release_trust_state_fixture_remains_readable() {
-        let state: TrustStateFile = serde_json::from_str(include_str!(
-            "../../tests/fixtures/stored-state/v1/trust.json"
-        ))
-        .unwrap();
-        assert_eq!(state.format_version, TRUST_STATE_FORMAT_VERSION);
-        assert_eq!(state.records.len(), 2);
+    fn same_major_trust_state_fixtures_remain_readable() {
+        for fixture in [
+            include_str!("../../tests/fixtures/stored-state/v1/trust.json"),
+            include_str!("../../tests/fixtures/stored-state/v0.1.1/trust.json"),
+        ] {
+            let state: TrustStateFile = serde_json::from_str(fixture).unwrap();
+            assert_eq!(state.format_version, TRUST_STATE_FORMAT_VERSION);
+            assert_eq!(state.records.len(), 2);
+        }
     }
 
     #[test]

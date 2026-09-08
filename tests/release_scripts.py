@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -43,6 +44,22 @@ def load_script(path: Path):
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def test_stored_state_checks_every_prior_release_seed(self) -> None:
+        checker = load_script(ROOT / "scripts/release/check_stored_state.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            fixtures = Path(temporary) / "stored-state"
+            shutil.copytree(checker.ROOT, fixtures)
+            with mock.patch.object(checker, "ROOT", fixtures):
+                checker.main()
+                for directory in ("v1", "v0.1.1"):
+                    with self.subTest(directory=directory):
+                        preview = fixtures / directory / "preview.json"
+                        original = preview.read_bytes()
+                        preview.write_bytes(original + b"\n")
+                        with self.assertRaisesRegex(SystemExit, "fixture changed"):
+                            checker.main()
+                        preview.write_bytes(original)
+
     @unittest.skipUnless(sys.platform == "win32", "PowerShell validation runs on Windows")
     def test_windows_installer_parses(self) -> None:
         subprocess.run(

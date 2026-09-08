@@ -181,7 +181,7 @@ cargo clippy --locked --all-targets --features fake-server -- -D warnings
 cargo test --locked --all-targets --features fake-server
 ```
 
-See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for the tested platform
+See the [v0.1.2 release notes](docs/releases/v0.1.2.md) for the tested platform
 floors, reference-server versions, and artifact provenance.
 
 ## License

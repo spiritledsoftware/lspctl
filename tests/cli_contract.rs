@@ -17,7 +17,7 @@ fn version_command_and_alias_emit_the_same_machine_envelope() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["command"], json!(["version"]));
     assert_eq!(envelope["result"]["name"], "lspctl");
-    assert_eq!(envelope["result"]["version"], "0.1.1");
+    assert_eq!(envelope["result"]["version"], "0.1.2");
     assert_eq!(envelope["result"]["contractVersion"], 1);
     assert_eq!(envelope["result"]["configVersion"], 1);
     assert_eq!(envelope["result"]["capabilityProfileVersion"], 1);
