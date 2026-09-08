@@ -18,7 +18,7 @@ Effort: **S** hours, **M** roughly a day, **L** multiple days, including tests. 
 | 4 | [004](004-preserve-partial-result-chunks.md) | Preserve partial-result chunks across the Owner boundary | P1 | S | LOW | — | DONE — 111 tests; fmt/Clippy/schema/diff passed |
 | 5 | [005](005-prevent-owner-maintenance-starvation.md) | Prevent maintenance starvation under notification traffic | P1 | S | LOW | — | DONE — 113 tests; fmt/Clippy/diff passed |
 | 6 | [006](006-release-prejournal-preview-reservations.md) | Release Preview reservations before durable transaction ownership | P1 | S | LOW | — | DONE — 118 tests; fmt/Clippy/stored-state/diff passed |
-| 7 | [007](007-enforce-raw-document-scope.md) | Enforce explicit server selection for external raw Documents | P1 | S | LOW | — | TODO |
+| 7 | [007](007-enforce-raw-document-scope.md) | Enforce explicit server selection for external raw Documents | P1 | S | LOW | — | DONE — 120 tests; fmt/Clippy/schema/diff passed |
 | 8 | [008](008-bound-owner-handshakes.md) | Bound unauthenticated Owner admission and handshakes | P1 | S | LOW | — | TODO |
 | 9 | [009](009-decouple-trust-administration.md) | Decouple Trust administration from unrelated executable availability | P1 | M | MED | — | TODO |
 | 10 | [011](011-bound-language-server-writes.md) | Bound language-server writes and make incomplete delivery fatal | P1 | M | MED | 005 | TODO |

@@ -267,7 +267,7 @@ async fn dispatch_owner_query(
         workspace: &workspace,
         server: &authorized.server.name,
         explicit_language_id: invocation.option_string("--language-id"),
-        explicit_workspace: invocation.has_option("--workspace"),
+        server_explicitly_selected: invocation.has_option("--server"),
         documents: DocumentStore::new(
             configuration.synchronization.max_open_documents,
             configuration.synchronization.max_document_bytes,
@@ -346,7 +346,7 @@ struct OwnerQueryDispatcher<'a> {
     workspace: &'a crate::workspace::Workspace,
     server: &'a str,
     explicit_language_id: Option<String>,
-    explicit_workspace: bool,
+    server_explicitly_selected: bool,
     documents: DocumentStore,
     text_synchronization: TextSynchronization,
 }
@@ -358,9 +358,13 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
     ) -> Result<DispatchResponse, DispatchFailure> {
         let mut synchronized = Vec::new();
         for path in &request.synchronized_files {
-            let path =
-                validate_document_scope(self.workspace, path, self.explicit_workspace, false)
-                    .map_err(DispatchFailure::from)?;
+            let path = validate_document_scope(
+                self.workspace,
+                path,
+                self.server_explicitly_selected,
+                false,
+            )
+            .map_err(DispatchFailure::from)?;
             let language_id = crate::configuration::document_language_id(
                 self.configuration,
                 self.server,
