@@ -16,9 +16,9 @@ use async_lsp::{AnyRequest, ErrorCode, ResponseError, router::Router};
 use atomic_write_file::AtomicWriteFile;
 use serde_json::{Value, json};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{self as tokio_time, Instant as TokioInstant},
 };
@@ -48,6 +48,8 @@ const TRACE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const SERVER_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const OWNER_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_REQUEST_LIMIT: usize = 64;
+const OWNER_HANDSHAKE_LIMIT: usize = 4;
+const OWNER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct OwnerBootstrap {
     pub(crate) session_identity: String,
@@ -2257,56 +2259,119 @@ fn spawn_owner_listener(
     status: watch::Receiver<Value>,
     connection_closed: watch::Sender<Instant>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
+    spawn_owner_connections(
+        listener,
+        Arc::new(Semaphore::new(OWNER_HANDSHAKE_LIMIT)),
+        OWNER_HANDSHAKE_TIMEOUT,
+        connection_closed,
+        move |mut stream, permit, deadline| {
             let endpoint = endpoint.clone();
             let requests = requests.clone();
             let controls = controls.clone();
             let draining = Arc::clone(&draining);
             let status = status.clone();
+            async move {
+                let authenticated =
+                    authenticate_owner_connection(&mut stream, &endpoint, permit, deadline).await;
+                if let Ok(Some(request)) = authenticated {
+                    let _ = handle_owner_connection(
+                        stream, request, endpoint, requests, controls, draining, status,
+                    )
+                    .await;
+                }
+            }
+        },
+    )
+}
+
+fn spawn_owner_connections<F>(
+    listener: TcpListener,
+    admission: Arc<Semaphore>,
+    handshake_timeout: Duration,
+    connection_closed: watch::Sender<Instant>,
+    handler: impl Fn(TcpStream, OwnedSemaphorePermit, TokioInstant) -> F + Send + 'static,
+) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            // ponytail: four 64 MiB frames plus task/JSON overhead; allocate incrementally if too high.
+            // This bounds only unauthenticated work, not fairness under continuous hostile arrivals.
+            let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                drop(stream);
+                connection_closed.send_replace(Instant::now());
+                continue;
+            };
+            let deadline = TokioInstant::now() + handshake_timeout;
             let connection_closed = connection_closed.clone();
+            let handling = handler(stream, permit, deadline);
             tokio::spawn(async move {
-                let _ =
-                    handle_owner_connection(stream, endpoint, requests, controls, draining, status)
-                        .await;
+                handling.await;
                 connection_closed.send_replace(Instant::now());
             });
         }
     })
 }
 
+async fn authenticate_owner_connection<S>(
+    stream: &mut S,
+    endpoint: &OwnerEndpoint,
+    _permit: OwnedSemaphorePermit,
+    deadline: TokioInstant,
+) -> io::Result<Option<AuthenticatedOwnerRequest>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let timeout_error = || io::Error::new(io::ErrorKind::TimedOut, "Owner handshake timed out");
+    tokio_time::timeout_at(deadline, async {
+        // timeout_at polls ready work first; do not admit an already-expired request.
+        if TokioInstant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        let request: AuthenticatedOwnerRequest = read_owner_message(stream).await?;
+        let authenticated = request.owner_protocol_version == OWNER_PROTOCOL_VERSION
+            && request.session_identity == endpoint.session_identity
+            && request.owner_generation == endpoint.owner_generation
+            && constant_time_token_matches(&request.token, &endpoint.token);
+        // Framing/JSON decoding and identity validation can finish without yielding.
+        if TokioInstant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        if !authenticated {
+            let failure = OwnerResponse::failure(
+                &endpoint.owner_generation,
+                json!({
+                    "category": "unavailable",
+                    "code": "owner_unavailable",
+                    "message": "Owner authentication or identity verification failed.",
+                    "stage": "discover_owner",
+                    "delivery": "not_sent",
+                    "retry": "safe",
+                    "data": {"sessionIdentity": endpoint.session_identity, "reason": "authentication_failed"}
+                }),
+            );
+            write_owner_message(stream, &failure).await?;
+            return Ok(None);
+        }
+        Ok(Some(request))
+    })
+    .await
+    .map_err(|_| timeout_error())?
+}
+
 async fn handle_owner_connection(
     mut stream: TcpStream,
+    request: AuthenticatedOwnerRequest,
     endpoint: OwnerEndpoint,
     requests: mpsc::Sender<PendingOwnerRequest>,
     controls: mpsc::Sender<PendingOwnerRequest>,
     draining: Arc<AtomicBool>,
     status: watch::Receiver<Value>,
 ) -> io::Result<()> {
-    let request: AuthenticatedOwnerRequest = read_owner_message(&mut stream).await?;
-    if request.owner_protocol_version != OWNER_PROTOCOL_VERSION
-        || request.session_identity != endpoint.session_identity
-        || request.owner_generation != endpoint.owner_generation
-        || !constant_time_token_matches(&request.token, &endpoint.token)
-    {
-        let failure = OwnerResponse::failure(
-            &endpoint.owner_generation,
-            json!({
-                "category": "unavailable",
-                "code": "owner_unavailable",
-                "message": "Owner authentication or identity verification failed.",
-                "stage": "discover_owner",
-                "delivery": "not_sent",
-                "retry": "safe",
-                "data": {"sessionIdentity": endpoint.session_identity, "reason": "authentication_failed"}
-            }),
-        );
-        write_owner_message(&mut stream, &failure).await?;
-        return Ok(());
-    }
     if matches!(&request.request, OwnerRequest::Status) {
         let response = OwnerResponse::success(&endpoint.owner_generation, status.borrow().clone());
         write_owner_message(&mut stream, &response).await?;
@@ -2842,6 +2907,342 @@ fn rfc3339_after(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    struct HandshakeFixture {
+        endpoint: OwnerEndpoint,
+        admission: Arc<Semaphore>,
+        requests: mpsc::Receiver<PendingOwnerRequest>,
+        entered: mpsc::UnboundedReceiver<()>,
+        finished: mpsc::UnboundedReceiver<()>,
+        listener: JoinHandle<()>,
+    }
+
+    impl HandshakeFixture {
+        async fn new(handshake_timeout: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = OwnerEndpoint {
+                format_version: 1,
+                owner_protocol_version: OWNER_PROTOCOL_VERSION,
+                session_identity: "test-session".to_owned(),
+                owner_generation: "test-generation".to_owned(),
+                token: "test-only-token".to_owned(),
+                address: listener.local_addr().unwrap().to_string(),
+                workspace_uri: "file:///test-workspace/".to_owned(),
+                server: "test-server".to_owned(),
+                owner_pid: 0,
+                started_at: String::new(),
+                state: "ready".to_owned(),
+                failure: None,
+            };
+            let admission = Arc::new(Semaphore::new(OWNER_HANDSHAKE_LIMIT));
+            let (requests_tx, requests) = mpsc::channel(OWNER_QUEUE_LIMIT);
+            let (entered_tx, entered) = mpsc::unbounded_channel();
+            let (finished_tx, finished) = mpsc::unbounded_channel();
+            let endpoint_for_handler = endpoint.clone();
+            let (connection_closed, _) = watch::channel(Instant::now());
+            let listener = spawn_owner_connections(
+                listener,
+                Arc::clone(&admission),
+                handshake_timeout,
+                connection_closed,
+                move |mut stream, permit, deadline| {
+                    let endpoint = endpoint_for_handler.clone();
+                    let requests = requests_tx.clone();
+                    let entered = entered_tx.clone();
+                    let finished = finished_tx.clone();
+                    async move {
+                        let _ = entered.send(());
+                        let authenticated =
+                            authenticate_owner_connection(&mut stream, &endpoint, permit, deadline)
+                                .await;
+                        if let Ok(Some(request)) = authenticated {
+                            let (_, status) = watch::channel(json!({"state": "ready"}));
+                            let _ = handle_owner_connection(
+                                stream,
+                                request,
+                                endpoint,
+                                requests.clone(),
+                                requests,
+                                Arc::new(AtomicBool::new(false)),
+                                status,
+                            )
+                            .await;
+                        } else {
+                            drop(stream);
+                        }
+                        let _ = finished.send(());
+                    }
+                },
+            );
+            Self {
+                endpoint,
+                admission,
+                requests,
+                entered,
+                finished,
+                listener,
+            }
+        }
+
+        fn request(&self, request: OwnerRequest) -> AuthenticatedOwnerRequest {
+            AuthenticatedOwnerRequest {
+                owner_protocol_version: OWNER_PROTOCOL_VERSION,
+                session_identity: self.endpoint.session_identity.clone(),
+                owner_generation: self.endpoint.owner_generation.clone(),
+                token: self.endpoint.token.clone(),
+                queue_deadline_ms: None,
+                request,
+            }
+        }
+
+        async fn connect(&mut self) -> TcpStream {
+            let stream = TcpStream::connect(&self.endpoint.address).await.unwrap();
+            self.entered.recv().await.unwrap();
+            stream
+        }
+
+        async fn stop(&mut self) {
+            self.listener.abort();
+            assert!(
+                (&mut self.listener)
+                    .await
+                    .as_ref()
+                    .is_err_and(|error| error.is_cancelled())
+            );
+        }
+    }
+
+    impl Drop for HandshakeFixture {
+        fn drop(&mut self) {
+            self.listener.abort();
+        }
+    }
+
+    async fn assert_handshake_closed(stream: &mut TcpStream) {
+        let result = tokio_time::timeout(Duration::from_millis(500), stream.read_u8())
+            .await
+            .expect("unauthenticated socket exceeded its deadline");
+        assert!(result.is_err_and(|error| matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+        )));
+    }
+
+    #[tokio::test]
+    async fn owner_handshake_admission_is_bounded() {
+        tokio_time::timeout(Duration::from_secs(5), async {
+            let mut fixture = HandshakeFixture::new(Duration::from_secs(1)).await;
+            let mut stalled = Vec::new();
+            for _ in 0..4 {
+                stalled.push(fixture.connect().await);
+            }
+            assert_eq!(fixture.admission.available_permits(), 0);
+            for _ in 0..3 {
+                let mut excess = TcpStream::connect(&fixture.endpoint.address).await.unwrap();
+                tokio::select! {
+                    _ = fixture.entered.recv() => panic!("more than four authentication tasks admitted"),
+                    _ = assert_handshake_closed(&mut excess) => {}
+                }
+            }
+            assert!(fixture.entered.try_recv().is_err());
+            drop(stalled);
+            for _ in 0..4 {
+                fixture.finished.recv().await.unwrap();
+            }
+            assert_eq!(fixture.admission.available_permits(), 4);
+            fixture.stop().await;
+        }).await.expect("admission test watchdog");
+    }
+
+    #[tokio::test]
+    async fn owner_handshake_deadline_releases_admission() {
+        tokio_time::timeout(Duration::from_secs(5), async {
+            let mut fixture = HandshakeFixture::new(Duration::from_millis(100)).await;
+
+            // A ready request must not bypass an already-expired admission deadline.
+            let (mut peer, mut server) = tokio::io::duplex(1024);
+            write_owner_message(&mut peer, &fixture.request(OwnerRequest::Status))
+                .await
+                .unwrap();
+            let permit = Arc::clone(&fixture.admission).try_acquire_owned().unwrap();
+            let result = authenticate_owner_connection(
+                &mut server,
+                &fixture.endpoint,
+                permit,
+                TokioInstant::now() - Duration::from_millis(1),
+            )
+            .await;
+            assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+            assert_eq!(fixture.admission.available_permits(), 4);
+
+            let mut header = fixture.connect().await;
+            header.write_all(&[0]).await.unwrap();
+            let mut body = fixture.connect().await;
+            body.write_u32(8).await.unwrap();
+            body.write_all(b"{").await.unwrap();
+            assert_eq!(fixture.admission.available_permits(), 2);
+            assert_handshake_closed(&mut header).await;
+            assert_handshake_closed(&mut body).await;
+            for _ in 0..2 {
+                fixture.finished.recv().await.unwrap();
+            }
+            assert_eq!(fixture.admission.available_permits(), 4);
+
+            // Malformed JSON and over-limit frames also release admission without large allocations.
+            for bytes in [&b"\x00\x00\x00\x01!"[..], &u32::MAX.to_be_bytes()[..]] {
+                let mut stream = fixture.connect().await;
+                stream.write_all(bytes).await.unwrap();
+                assert_handshake_closed(&mut stream).await;
+                fixture.finished.recv().await.unwrap();
+                assert_eq!(fixture.admission.available_permits(), 4);
+            }
+            let mut stream = fixture.connect().await;
+            write_owner_message(&mut stream, &fixture.request(OwnerRequest::Status))
+                .await
+                .unwrap();
+            let response: OwnerResponse = read_owner_message(&mut stream).await.unwrap();
+            assert!(response.ok);
+            assert_eq!(response.result.unwrap()["state"], "ready");
+            fixture.finished.recv().await.unwrap();
+            assert_eq!(fixture.admission.available_permits(), 4);
+
+            // Already-admitted handshakes still expire after the accept loop shuts down.
+            let mut stalled = fixture.connect().await;
+            fixture.stop().await;
+            assert_handshake_closed(&mut stalled).await;
+            fixture.finished.recv().await.unwrap();
+            assert_eq!(fixture.admission.available_permits(), 4);
+        })
+        .await
+        .expect("handshake deadline test watchdog");
+    }
+
+    #[tokio::test]
+    async fn owner_handshake_failure_response_is_bounded() {
+        tokio_time::timeout(Duration::from_secs(5), async {
+            let mut fixture = HandshakeFixture::new(Duration::from_millis(100)).await;
+            for invalid_field in 0..4 {
+                let mut request = fixture.request(OwnerRequest::Status);
+                match invalid_field {
+                    0 => request.owner_protocol_version += 1,
+                    1 => request.session_identity.push('!'),
+                    2 => request.owner_generation.push('!'),
+                    _ => request.token.push('!'),
+                }
+                // Preserve the existing failure JSON whenever the peer reads it.
+                let mut stream = fixture.connect().await;
+                write_owner_message(&mut stream, &request).await.unwrap();
+                let response: OwnerResponse = read_owner_message(&mut stream).await.unwrap();
+                assert!(!response.ok);
+                assert_eq!(
+                    response.error.as_ref().unwrap()["code"],
+                    "owner_unavailable"
+                );
+                assert_eq!(
+                    response.error.unwrap()["data"]["reason"],
+                    "authentication_failed"
+                );
+                fixture.finished.recv().await.unwrap();
+                assert_eq!(fixture.admission.available_permits(), 4);
+
+                // A one-byte duplex capacity deterministically blocks the failure response.
+                let (mut peer, mut server) = tokio::io::duplex(1);
+                let permit = Arc::clone(&fixture.admission).try_acquire_owned().unwrap();
+                let deadline = TokioInstant::now() + Duration::from_millis(100);
+                let (finished_tx, finished_rx) = oneshot::channel();
+                let authentication = async {
+                    let result = tokio_time::timeout_at(
+                        deadline + Duration::from_millis(50),
+                        authenticate_owner_connection(
+                            &mut server,
+                            &fixture.endpoint,
+                            permit,
+                            deadline,
+                        ),
+                    )
+                    .await
+                    .expect("failure write restarted or exceeded the handshake deadline");
+                    assert!(
+                        matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut)
+                    );
+                    finished_tx.send(()).unwrap();
+                };
+                let caller = async {
+                    // Spend most of the same absolute budget receiving the request.
+                    tokio_time::sleep_until(deadline - Duration::from_millis(25)).await;
+                    write_owner_message(&mut peer, &request).await.unwrap();
+                    peer.read_u8().await.unwrap();
+                    finished_rx.await.unwrap();
+                };
+                tokio::join!(authentication, caller);
+                assert_eq!(fixture.admission.available_permits(), 4);
+            }
+            fixture.stop().await;
+        })
+        .await
+        .expect("failure response test watchdog");
+    }
+
+    #[tokio::test]
+    async fn owner_handshake_does_not_deadline_authenticated_query() {
+        tokio_time::timeout(Duration::from_secs(5), async {
+            let mut fixture = HandshakeFixture::new(Duration::from_millis(100)).await;
+            let mut stream = fixture.connect().await;
+            let mut request = fixture.request(OwnerRequest::Dispatch {
+                method: "test/query".to_owned(),
+                params: None,
+                documents: Vec::new(),
+                refresh_open_documents: false,
+                raw_request: true,
+                request_timeout_ms: 2000,
+                trace_protocol: false,
+                apply_edits: false,
+            });
+            request.queue_deadline_ms = Some(2000);
+            write_owner_message(&mut stream, &request).await.unwrap();
+            let pending = fixture.requests.recv().await.unwrap();
+            assert!(matches!(pending.request, OwnerRequest::Dispatch { .. }));
+            assert_eq!(fixture.admission.available_permits(), 4);
+            assert!(
+                tokio_time::timeout(
+                    Duration::from_millis(200),
+                    read_owner_message::<_, OwnerResponse>(&mut stream)
+                )
+                .await
+                .is_err(),
+                "queued Query inherited the handshake deadline"
+            );
+            assert!(!*pending.cancelled.borrow());
+            pending.dispatched.send(()).unwrap();
+            assert!(
+                tokio_time::timeout(
+                    Duration::from_millis(200),
+                    read_owner_message::<_, OwnerResponse>(&mut stream)
+                )
+                .await
+                .is_err(),
+                "active Query inherited the handshake deadline"
+            );
+            assert!(!*pending.cancelled.borrow());
+            assert_eq!(fixture.admission.available_permits(), 4);
+            pending
+                .response
+                .send(OwnerResponse::success(
+                    &fixture.endpoint.owner_generation,
+                    json!({"completed": true}),
+                ))
+                .unwrap();
+            let response: OwnerResponse = read_owner_message(&mut stream).await.unwrap();
+            assert!(response.ok);
+            assert_eq!(response.result.unwrap()["completed"], true);
+            pending.delivered.await.unwrap();
+            fixture.finished.recv().await.unwrap();
+            fixture.stop().await;
+        })
+        .await
+        .expect("authenticated Query test watchdog");
+    }
 
     #[test]
     fn file_operation_filters_honor_kind_glob_and_case_options() {

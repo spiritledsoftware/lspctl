@@ -7,7 +7,7 @@
 
 ## Status
 
-- **Status:** TODO
+- **Status:** DONE
 - **Priority:** P1
 - **Effort:** S
 - **Risk:** LOW
@@ -149,13 +149,24 @@ The four named tests cover cap, incomplete header/body timeouts, failure-output 
 
 ## Done criteria
 
-- [ ] Four `owner_handshake_` tests are listed and pass with bounded cleanup.
-- [ ] No task is spawned merely to wait for preauthentication admission.
-- [ ] The permit is released before valid authenticated request processing.
-- [ ] One absolute deadline covers the read and authentication-failure write.
-- [ ] Lifecycle/full tests, formatting, Clippy, schema/state checks, and `git diff --check` exit 0.
-- [ ] No new dependency, public setting, protocol field, or out-of-scope modification.
-- [ ] Row 008 in the index records completion/verification or a blocking reason.
+- [x] Four `owner_handshake_` tests are listed and pass with bounded cleanup.
+- [x] No task is spawned merely to wait for preauthentication admission.
+- [x] The permit is released before valid authenticated request processing.
+- [x] One absolute deadline covers the read and authentication-failure write.
+- [x] Lifecycle/full tests, formatting, Clippy, schema/state checks, and `git diff --check` exit 0.
+- [x] No new dependency, public setting, protocol field, or out-of-scope modification.
+- [x] Row 008 in the index records completion/verification or a blocking reason.
+
+## Completion evidence
+
+- Initial worktree was clean at `c8b6413`. Drift from `5268c6a` was confined to completed plans 004/005 (partial-result chunks and Owner maintenance); authentication and framing were unchanged. Baseline full suite: 120 tests passed, including their regressions.
+- Extracted private listener/authentication seams before enabling the policy. Exact four-test discovery passed; the red run failed the admission, incomplete-frame deadline, and blocked-failure-write assertions. The authenticated Query lifetime control passed.
+- Admission now uses `try_acquire_owned` before spawning, with four permits and a five-second absolute deadline. Authentication owns the permit, so every return/cancellation releases it before authenticated processing. Existing framing, identity/token checks, queue policy, and connection-close notifications remain intact.
+- Independent review found that Tokio can poll a ready request past an expired deadline. A prebuffered expired-request regression reproduced this; explicit checks before reading and after decoding/validation now deny it.
+- Final focused discovery lists exactly four tests; all four pass. Coverage includes excess sockets, partial headers/bodies, malformed/oversized frames, listener shutdown, failure-response backpressure and all authentication fields, post-timeout Status recovery, and queued/active Query responses beyond the handshake interval with all permits available.
+- `cargo test --locked --features fake-server --test owner_lifecycle`: 21 passed. Final `cargo test --locked --all-targets --features fake-server`: 124 passed.
+- Clippy with `-D warnings`, formatting, schema check, stored-state check, and `git diff --check`: all exited 0.
+- Implementation changes are confined to `src/session/owner_runtime.rs`; only this plan and index row 008 accompany them. No dependency or public contract changes. Verified on Linux; native macOS/Windows verification remains for CI.
 
 ## STOP conditions
 
